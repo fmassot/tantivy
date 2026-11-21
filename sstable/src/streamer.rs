@@ -255,8 +255,7 @@ where
 }
 
 impl<TSSTable> Streamer<'_, TSSTable, AlwaysMatch>
-where
-    TSSTable: SSTable,
+where TSSTable: SSTable
 {
     pub fn empty() -> Self {
         Streamer {
@@ -433,6 +432,7 @@ where
             self.states.truncate(common_prefix_len + 1);
             let mut state: A::State = self.states.last().unwrap().clone();
             let mut is_dead = !self.automaton.can_match(&state);
+            let mut always_matched = false;
             if is_dead {
                 self.dead_at = Some(common_prefix_len);
             } else {
@@ -446,11 +446,16 @@ where
                         is_dead = true;
                         break;
                     }
+                    if self.automaton.will_always_match(&state) {
+                        self.always_match_at = Some(self.states.len() - 1);
+                        always_matched = true;
+                        break;
+                    }
                 }
             }
 
-            let matches = !is_dead && self.automaton.is_match(&state);
-            if matches {
+            let matches = always_matched || (!is_dead && self.automaton.is_match(&state));
+            if matches && !always_matched {
                 self.always_match_at = self
                     .states
                     .iter()

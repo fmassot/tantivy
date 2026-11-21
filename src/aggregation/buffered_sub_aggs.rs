@@ -34,6 +34,7 @@ pub(crate) struct BufferedSubAggs<B: SubAggBuffer> {
     buffer: B,
     sub_agg_collector: Box<dyn SegmentAggregationCollector>,
     num_docs: usize,
+    flush_threshold: usize,
 }
 
 pub type LowCardBufferedSubAggs = BufferedSubAggs<LowCardSubAggBuffer>;
@@ -56,15 +57,27 @@ pub trait SubAggBuffer: Debug {
 
 impl<Backend: SubAggBuffer + Debug> BufferedSubAggs<Backend> {
     pub fn new(sub_agg: Box<dyn SegmentAggregationCollector>) -> Self {
+        Self::with_flush_threshold(sub_agg, FLUSH_THRESHOLD)
+    }
+
+    pub fn with_flush_threshold(
+        sub_agg: Box<dyn SegmentAggregationCollector>,
+        flush_threshold: usize,
+    ) -> Self {
         Self {
             buffer: Backend::new(),
             sub_agg_collector: sub_agg,
             num_docs: 0,
+            flush_threshold,
         }
     }
 
     pub fn get_sub_agg_collector(&mut self) -> &mut dyn SegmentAggregationCollector {
         &mut *self.sub_agg_collector
+    }
+
+    pub fn into_inner(self) -> Box<dyn SegmentAggregationCollector> {
+        self.sub_agg_collector
     }
 
     #[inline]
@@ -79,7 +92,7 @@ impl<Backend: SubAggBuffer + Debug> BufferedSubAggs<Backend> {
         &mut self,
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        if self.num_docs >= FLUSH_THRESHOLD {
+        if self.num_docs >= self.flush_threshold {
             self.buffer
                 .flush_local(&mut self.sub_agg_collector, agg_data)?;
             self.num_docs = 0;

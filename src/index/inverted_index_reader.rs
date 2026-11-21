@@ -506,8 +506,8 @@ impl InvertedIndexReader {
             .get_term_range_async(.., automaton.clone(), None, MERGE_HOLES_UNDER_BYTES)
             .await?;
 
-        const MIN_BYTES_PER_CHUNK: usize = 6 * 1024 * 1024;
-        const MAX_CHUNKS: usize = 4;
+        const MIN_BYTES_PER_CHUNK: usize = 2 * 1024 * 1024;
+        const MAX_CHUNKS: usize = 8;
         if let Some(chunks) =
             self.termdict
                 .automaton_block_chunks(&automaton, MAX_CHUNKS, MIN_BYTES_PER_CHUNK)?
@@ -575,6 +575,92 @@ impl InvertedIndexReader {
             .into_inner()
             .unwrap();
         Ok(term_infos)
+    }
+
+    /// Warms postings for a literal byte-substring predicate (e.g. `.*needle.*`) without walking
+    /// the FST index or running a regex DFA, returning all matched [`TermInfo`] entries.
+    ///
+    /// When the term dictionary is large (`>= 4 MiB` compressed), blocks are partitioned into up
+    /// to 8 byte-balanced chunks and scanned in parallel via `executor`.
+    pub async fn warm_postings_substring_collecting_term_infos<
+        E: Fn(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
+        F: std::future::Future<Output = io::Result<()>>,
+    >(
+        &self,
+        needle: Vec<u8>,
+        disallow_newline: bool,
+        executor: E,
+    ) -> io::Result<Vec<TermInfo>> {
+        // Download the entire SSTable byte slice in one contiguous async read.
+        let full_slice = self.termdict.read_all_sstable_bytes_async().await?;
+
+        const MIN_BYTES_PER_CHUNK: usize = 2 * 1024 * 1024;
+        const MAX_CHUNKS: usize = 8;
+
+        let all_term_infos = if let Some(chunks) = self
+            .termdict
+            .all_block_chunks(MAX_CHUNKS, MIN_BYTES_PER_CHUNK)?
+        {
+            let needle_arc = Arc::new(needle);
+            let num_chunks = chunks.len();
+            let chunk_results: Vec<Arc<std::sync::Mutex<Vec<TermInfo>>>> = (0..num_chunks)
+                .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
+                .collect();
+            let mut chunk_futures = Vec::with_capacity(num_chunks);
+            for ((slice, _first_ord), out_slot) in
+                chunks.into_iter().zip(chunk_results.iter().cloned())
+            {
+                let termdict = self.termdict.clone();
+                let needle_clone = needle_arc.clone();
+                chunk_futures.push(executor(Box::new(move || {
+                    let matched = termdict.stream_values_containing_bytes(
+                        slice,
+                        &needle_clone,
+                        disallow_newline,
+                    )?;
+                    *out_slot.lock().unwrap() = matched;
+                    Ok(())
+                })));
+            }
+            futures_util::future::try_join_all(chunk_futures).await?;
+
+            let mut combined = Vec::new();
+            for slot in chunk_results {
+                let chunk_infos = Arc::try_unwrap(slot)
+                    .expect("chunk task has completed")
+                    .into_inner()
+                    .unwrap();
+                combined.extend(chunk_infos);
+            }
+            combined
+        } else {
+            let termdict = self.termdict.clone();
+            let out_slot = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let out_slot_clone = out_slot.clone();
+            executor(Box::new(move || {
+                let matched = termdict.stream_values_containing_bytes(
+                    full_slice,
+                    &needle,
+                    disallow_newline,
+                )?;
+                *out_slot_clone.lock().unwrap() = matched;
+                Ok(())
+            }))
+            .await?;
+            Arc::try_unwrap(out_slot)
+                .expect("substring warmup task has completed")
+                .into_inner()
+                .unwrap()
+        };
+
+        let (sender, posting_ranges_to_load_stream) = futures_channel::mpsc::unbounded();
+        send_coalesced_posting_ranges(
+            all_term_infos.iter().map(|ti| ti.postings_range.clone()),
+            sender,
+        )?;
+        self.download_posting_ranges(posting_ranges_to_load_stream)
+            .await?;
+        Ok(all_term_infos)
     }
 
     /// Warms postings for one automaton and returns a bitset of matching document IDs.

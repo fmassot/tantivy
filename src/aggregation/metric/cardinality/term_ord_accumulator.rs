@@ -150,6 +150,8 @@ pub(crate) trait TermOrdAccumulator: Sized {
     fn maybe_compact(&mut self) {}
     fn len(&self) -> usize;
     fn iter_ords(&self) -> impl Iterator<Item = u64> + '_;
+    /// Returns `true` if `iter_ords()` yields strictly ascending ordinals.
+    fn is_iter_sorted(&self) -> bool;
 }
 
 impl TermOrdAccumulator for BitSet {
@@ -181,6 +183,11 @@ impl TermOrdAccumulator for BitSet {
                 .map(move |bit| chunk_base + u64::from(bit))
         })
     }
+    #[inline]
+    fn is_iter_sorted(&self) -> bool {
+        true
+    }
+
     #[inline(never)] //< required to not have a perf regression
     fn extend_from_iter(&mut self, ords: impl IntoIterator<Item = u64>) {
         for ord in ords {
@@ -235,6 +242,11 @@ impl TermOrdAccumulator for TermOrdSet {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn is_iter_sorted(&self) -> bool {
+        matches!(self.inner, TermOrdSetInner::Dense(_))
     }
 
     fn maybe_compact(&mut self) {

@@ -52,6 +52,16 @@ impl BlockReader {
         }
     }
 
+    /// Replaces the underlying block bytes while reusing the allocated decompression buffer
+    /// and Zstd decompression context across sequential/random block jumps.
+    pub fn reset(&mut self, reader: OwnedBytes) {
+        self.buffer.clear();
+        self.reader = reader;
+        self.next_readers = Vec::new().into_iter();
+        self.offset = 0;
+        self.pending_first_ordinal = None;
+    }
+
     /// The first term ordinal of the slice most recently moved to, if it has not been taken yet.
     ///
     /// Returns `Some` exactly once per slice, on the first term read from it, so a caller can

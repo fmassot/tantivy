@@ -7,7 +7,7 @@ use common::{CountingWriter, OwnedBytes};
 use zstd::bulk::Compressor;
 
 use super::value::ValueWriter;
-use super::{value, vint, BlockReader};
+use super::{BlockReader, value, vint};
 
 const FOUR_BIT_LIMITS: usize = 1 << 4;
 const VINT_MODE: u8 = 1u8;
@@ -247,6 +247,17 @@ where TValueReader: value::ValueReader
         }
     }
 
+    /// Resets this reader to read a new single block while reusing its internal decompression
+    /// buffer and Zstd context.
+    pub fn reset_block(&mut self, reader: OwnedBytes) {
+        self.idx = 0;
+        self.common_prefix_len = 0;
+        self.suffix_range = 0..0;
+        self.value_block_range = 0..0;
+        self.values_loaded = true;
+        self.block_reader.reset(reader);
+    }
+
     /// The first term ordinal of the slice just moved to, returned once per slice.
     ///
     /// A caller tracking term ordinals must consult this after every [`DeltaReader::advance`]:
@@ -341,6 +352,43 @@ where TValueReader: value::ValueReader
             self.idx += 1;
         }
         Ok(self.read_delta_key())
+    }
+
+    /// Loads the next block into the decompression buffer (deferring value decoding when supported)
+    /// and returns the raw delta-encoded key bytes of the block, or `Ok(None)` at EOF.
+    ///
+    /// Callers can inspect the returned slice to skip whole blocks, or iterate keys within the
+    /// block via [`Self::advance_in_block`].
+    #[inline]
+    pub fn next_block_lazy(&mut self) -> io::Result<Option<&[u8]>> {
+        if !self.block_reader.read_block()? {
+            return Ok(None);
+        }
+        let start_offset = self.block_reader.offset();
+        if let Some(skip_res) = self.value_reader.skip(self.block_reader.buffer()) {
+            let consumed_len = skip_res?;
+            self.value_block_range = start_offset..(start_offset + consumed_len);
+            self.values_loaded = false;
+            self.block_reader.advance(consumed_len);
+        } else {
+            let consumed_len = self.value_reader.load(self.block_reader.buffer())?;
+            self.value_block_range = start_offset..(start_offset + consumed_len);
+            self.values_loaded = true;
+            self.block_reader.advance(consumed_len);
+        }
+        self.idx = usize::MAX;
+        Ok(Some(self.block_reader.buffer()))
+    }
+
+    /// Advances to the next key within the block loaded by [`Self::next_block_lazy`], returning
+    /// `false` once all keys in the block have been read.
+    #[inline(always)]
+    pub fn advance_in_block(&mut self) -> bool {
+        if self.block_reader.buffer().is_empty() {
+            return false;
+        }
+        self.idx = self.idx.wrapping_add(1);
+        self.read_delta_key()
     }
 
     /// Decodes the current block's values if [`DeltaReader::advance_lazy`] deferred them.

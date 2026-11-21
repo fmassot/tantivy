@@ -21,7 +21,9 @@ use crate::aggregation::agg_data::AggregationsSegmentCtx;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
 };
-use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
+use crate::aggregation::segment_agg_result::{
+    collect_multiple_fallback, is_strictly_increasing, SegmentAggregationCollector,
+};
 use crate::aggregation::*;
 
 /// A CouponCache is here to cache the mapping term ordinal -> coupon (see above).
@@ -97,6 +99,9 @@ pub(crate) struct SegmentStrCardinalityCollector<S: TermOrdAccumulator> {
     /// Buckets are Some(_) until they get consumed by
     /// `add_intermediate_aggregation_result`.
     buckets: Vec<Option<S>>,
+    /// Most recent term ordinal inserted per bucket (`u64::MAX` means none yet), skipping
+    /// consecutive duplicates before touching the set/bitset.
+    last_ords: Vec<u64>,
     /// The request data. Its accessor gives access to the term ordinals.
     req_data: CardinalityAggReqData,
     /// Lazily built at finalization time, shared by every bucket.
@@ -207,10 +212,19 @@ impl<S: TermOrdAccumulator> SegmentStrCardinalityCollector<S> {
     pub(crate) fn from_req(req_data: CardinalityAggReqData, max_term_ord_inclusive: u64) -> Self {
         Self {
             buckets: Vec::new(),
+            last_ords: Vec::new(),
             req_data,
             coupon_cache: None,
             max_term_ord_inclusive,
         }
+    }
+}
+
+fn missing_coupon_for_key(missing_key: &Key) -> Coupon {
+    if let Key::Str(missing_value_str) = missing_key {
+        Coupon::from_value(missing_value_str.as_bytes())
+    } else {
+        Coupon::from_value("__tantivy_missing_non_str__".as_bytes())
     }
 }
 
@@ -231,6 +245,44 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                 "a `Str` value source must provide a term dictionary".to_string(),
             ));
         };
+        let name = req_data.name.to_string();
+
+        // Single-bucket fast path (e.g. top-level cardinality over a str column):
+        // stream unique ordinals directly into the HLL sketch without building an
+        // intermediate FxHashSet, Vec<Coupon>, or CouponCache.
+        if self.buckets.len() == 1 && self.coupon_cache.is_none() {
+            let Some(term_ords) = self.buckets[bucket_id as usize].take() else {
+                return Err(crate::TantivyError::InternalError(
+                    "the same bucket should not be finalized twice.".to_string(),
+                ));
+            };
+            let mut cardinality = CardinalityCollector::new(ColumnType::Str as u8);
+            let mut ords: Vec<u64> = Vec::with_capacity(term_ords.len());
+            ords.extend(term_ords.iter_ords());
+            if !term_ords.is_iter_sorted() {
+                ords.sort_unstable();
+            }
+            let had_missing = ords
+                .pop_if(|highest_term_ord| *highest_term_ord >= term_dictionary.num_terms())
+                .is_some();
+            let all_found = term_dictionary.sorted_ords_to_term_cb(&ords, &mut |term_bytes| {
+                cardinality.insert_coupon(Coupon::from_value(term_bytes));
+            })?;
+            assert!(all_found);
+            if had_missing {
+                if let Some(missing_key) = req_data.req.missing.as_ref() {
+                    cardinality.insert_coupon(missing_coupon_for_key(missing_key));
+                }
+            }
+            results.push(
+                name,
+                IntermediateAggregationResult::Metric(IntermediateMetricResult::Cardinality(
+                    cardinality,
+                )),
+            )?;
+            return Ok(());
+        }
+
         // Strings are dictionary encoded. Fetching the terms associated to strings
         // is expensive. For this reason, we do that once for all buckets and cache the results
         // here.
@@ -244,7 +296,6 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                 req_data.req.missing.as_ref(),
             )?);
         }
-        let name = req_data.name.to_string();
         // take the bucket in buckets and replace it with a new empty one
         let Some(term_ords) = self.buckets[bucket_id as usize].take() else {
             return Err(crate::TantivyError::InternalError(
@@ -276,19 +327,92 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
             &mut *self.req_data.accessor,
             self.req_data.missing_value_for_accessor,
         );
-        let Some(term_ords) = self.buckets[parent_bucket_id as usize].as_mut() else {
+        let bucket_idx = parent_bucket_id as usize;
+        let Some(term_ords) = self.buckets[bucket_idx].as_mut() else {
             return Err(crate::TantivyError::InternalError(
                 "collection should not happen after finalization".to_string(),
             ));
         };
-        // Promotion check runs on the pre-block state: the first call
-        // sees an empty set (no-op), and the last block of inserts
-        // doesn't trigger a promotion of a set we won't grow further.
-        // The trait dispatches once per block (via `extend_from_iter`)
-        // for adaptive variants and inlines to a tight loop for the
-        // BitSet path.
         term_ords.maybe_compact();
-        term_ords.extend_from_iter(agg_data.column_block_accessor.iter_vals());
+        let mut last_ord = self.last_ords[bucket_idx];
+        term_ords.extend_from_iter(
+            agg_data
+                .column_block_accessor
+                .values()
+                .iter()
+                .copied()
+                .filter(|&ord| {
+                    if ord == last_ord {
+                        false
+                    } else {
+                        last_ord = ord;
+                        true
+                    }
+                }),
+        );
+        self.last_ords[bucket_idx] = last_ord;
+        Ok(())
+    }
+
+    fn collect_multiple(
+        &mut self,
+        bucket_ids: &[BucketId],
+        docs: &[crate::DocId],
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        debug_assert_eq!(bucket_ids.len(), docs.len());
+        if docs.is_empty() {
+            return Ok(());
+        }
+        if !is_strictly_increasing(docs) {
+            return collect_multiple_fallback(self, bucket_ids, docs, agg_data);
+        }
+        agg_data
+            .column_block_accessor
+            .fetch_block_with_missing_ordered(
+                docs,
+                &mut *self.req_data.accessor,
+                self.req_data.missing_value_for_accessor,
+                true,
+            );
+        let col_block_accessor = &agg_data.column_block_accessor;
+        let vals = col_block_accessor.values();
+        if col_block_accessor.cardinality().is_full() {
+            for (&bucket_id, &ord) in bucket_ids.iter().zip(vals.iter()) {
+                let bucket_idx = bucket_id as usize;
+                if self.last_ords[bucket_idx] == ord {
+                    continue;
+                }
+                self.last_ords[bucket_idx] = ord;
+                let Some(term_ords) = self.buckets[bucket_idx].as_mut() else {
+                    return Err(crate::TantivyError::InternalError(
+                        "collection should not happen after finalization".to_string(),
+                    ));
+                };
+                term_ords.maybe_compact();
+                term_ords.insert(ord);
+            }
+        } else {
+            let fetched_docs = col_block_accessor.docids();
+            let mut doc_pos = 0usize;
+            for (&doc, &ord) in fetched_docs.iter().zip(vals.iter()) {
+                while docs[doc_pos] < doc {
+                    doc_pos += 1;
+                }
+                let bucket_idx = bucket_ids[doc_pos] as usize;
+                if self.last_ords[bucket_idx] == ord {
+                    continue;
+                }
+                self.last_ords[bucket_idx] = ord;
+                let Some(term_ords) = self.buckets[bucket_idx].as_mut() else {
+                    return Err(crate::TantivyError::InternalError(
+                        "collection should not happen after finalization".to_string(),
+                    ));
+                };
+                term_ords.maybe_compact();
+                term_ords.insert(ord);
+            }
+        }
         Ok(())
     }
 
@@ -297,11 +421,12 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
         max_bucket: BucketId,
         _agg_data: &AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        if max_bucket as usize >= self.buckets.len() {
+        let required = max_bucket as usize + 1;
+        if required > self.buckets.len() {
             let max_term_ord_inclusive = self.max_term_ord_inclusive;
-            self.buckets.resize_with(max_bucket as usize + 1, || {
-                Some(S::new(max_term_ord_inclusive))
-            });
+            self.buckets
+                .resize_with(required, || Some(S::new(max_term_ord_inclusive)));
+            self.last_ords.resize(required, u64::MAX);
         }
         Ok(())
     }

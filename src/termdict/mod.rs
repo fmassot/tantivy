@@ -153,9 +153,7 @@ impl TermDictionary {
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
     pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> TermStreamerBuilder<'a, A>
-    where
-        A::State: Clone,
-    {
+    where A::State: Clone {
         self.0.search(automaton)
     }
 
@@ -181,6 +179,31 @@ impl TermDictionary {
         A::State: Clone,
     {
         self.0.stream_values_from_slices(slices, automaton)
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) async fn read_all_sstable_bytes_async(&self) -> io::Result<common::OwnedBytes> {
+        self.0.sstable_slice.read_bytes_async().await
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn all_block_chunks(
+        &self,
+        max_chunks: usize,
+        min_bytes_per_chunk: usize,
+    ) -> io::Result<Option<Vec<(common::OwnedBytes, u64)>>> {
+        self.0.all_block_chunks(max_chunks, min_bytes_per_chunk)
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn stream_values_containing_bytes(
+        &self,
+        slice: common::OwnedBytes,
+        needle: &[u8],
+        disallow_newline: bool,
+    ) -> io::Result<Vec<TermInfo>> {
+        self.0
+            .stream_values_containing_bytes(slice, needle, disallow_newline)
     }
 
     #[cfg(feature = "quickwit")]

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use common::{BinarySerializable, CountingWriter, DeserializeFrom, OwnedBytes, VInt};
 use fastdivide::DividerU64;
-use tantivy_bitpacker::{BitPacker, BitUnpacker, compute_num_bits};
+use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
 use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 use crate::{ColumnValues, RowId};
@@ -440,11 +440,20 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
 
             if block.num_runs == BLOCK_SIZE as u16 {
                 let run_data = &data[block.data_start_offset..];
-                while i < len && (docs[i] >> 8) as usize == block_id {
-                    let in_block = docs[i] & 255;
-                    let offset_val = bit_unpacker.get(in_block, run_data);
-                    output[i] = block_base.wrapping_add(gcd.wrapping_mul(offset_val));
-                    i += 1;
+                if gcd == 1 {
+                    while i < len && (docs[i] >> 8) as usize == block_id {
+                        let in_block = docs[i] & 255;
+                        let offset_val = bit_unpacker.get(in_block, run_data);
+                        output[i] = block_base.wrapping_add(offset_val);
+                        i += 1;
+                    }
+                } else {
+                    while i < len && (docs[i] >> 8) as usize == block_id {
+                        let in_block = docs[i] & 255;
+                        let offset_val = bit_unpacker.get(in_block, run_data);
+                        output[i] = block_base.wrapping_add(gcd.wrapping_mul(offset_val));
+                        i += 1;
+                    }
                 }
                 continue;
             }
@@ -462,15 +471,37 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
             let word_prefix = [0u32, p1, p2, p3];
             let run_data = &data[block.data_start_offset + BITMAP_BYTES..];
 
-            while i < len && (docs[i] >> 8) as usize == block_id {
-                let in_block = (docs[i] & 255) as usize;
-                let word_idx = in_block >> 6;
-                let bit_idx = in_block & 63;
-                let mask = u64::MAX >> (63 - bit_idx);
-                let run_idx = word_prefix[word_idx] + (words[word_idx] & mask).count_ones() - 1;
-                let offset_val = bit_unpacker.get(run_idx, run_data);
-                output[i] = block_base.wrapping_add(gcd.wrapping_mul(offset_val));
-                i += 1;
+            let mut prev_run_idx = u32::MAX;
+            let mut prev_val = 0u64;
+            if gcd == 1 {
+                while i < len && (docs[i] >> 8) as usize == block_id {
+                    let in_block = (docs[i] & 255) as usize;
+                    let word_idx = in_block >> 6;
+                    let bit_idx = in_block & 63;
+                    let mask = u64::MAX >> (63 - bit_idx);
+                    let run_idx = word_prefix[word_idx] + (words[word_idx] & mask).count_ones() - 1;
+                    if run_idx != prev_run_idx {
+                        prev_run_idx = run_idx;
+                        prev_val = block_base.wrapping_add(bit_unpacker.get(run_idx, run_data));
+                    }
+                    output[i] = prev_val;
+                    i += 1;
+                }
+            } else {
+                while i < len && (docs[i] >> 8) as usize == block_id {
+                    let in_block = (docs[i] & 255) as usize;
+                    let word_idx = in_block >> 6;
+                    let bit_idx = in_block & 63;
+                    let mask = u64::MAX >> (63 - bit_idx);
+                    let run_idx = word_prefix[word_idx] + (words[word_idx] & mask).count_ones() - 1;
+                    if run_idx != prev_run_idx {
+                        prev_run_idx = run_idx;
+                        let offset_val = bit_unpacker.get(run_idx, run_data);
+                        prev_val = block_base.wrapping_add(gcd.wrapping_mul(offset_val));
+                    }
+                    output[i] = prev_val;
+                    i += 1;
+                }
             }
         }
     }
@@ -479,6 +510,9 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
         if output.is_empty() {
             return;
         }
+        let min_value = self.stats.min_value;
+        let gcd = self.stats.gcd.get();
+        let data = self.data.as_slice();
         let mut pos = start as u32;
         let mut written = 0usize;
         let total = output.len();
@@ -490,33 +524,76 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
             let take = (block_len - in_block_start).min(total - written);
             let in_block_end = in_block_start + take;
             let block = &self.blocks[block_id];
+            let block_base = min_value.wrapping_add(gcd.wrapping_mul(block.min_val));
             let out_slice = &mut output[written..written + take];
 
             if block.bit_unpacker.bit_width() == 0 {
-                out_slice.fill(self.decode_norm(block.min_val));
+                out_slice.fill(block_base);
             } else if block.num_runs == BLOCK_SIZE as u16 {
                 block.bit_unpacker.get_range(
                     in_block_start as u32,
-                    &self.data[block.data_start_offset..],
+                    &data[block.data_start_offset..],
                     out_slice,
                 );
-                for val in out_slice.iter_mut() {
-                    *val = self.decode_norm(block.min_val + *val);
+                if gcd == 1 {
+                    for val in out_slice.iter_mut() {
+                        *val = block_base.wrapping_add(*val);
+                    }
+                } else {
+                    for val in out_slice.iter_mut() {
+                        *val = block_base.wrapping_add(gcd.wrapping_mul(*val));
+                    }
                 }
             } else {
-                let bitmap =
-                    &self.data[block.data_start_offset..block.data_start_offset + BITMAP_BYTES];
-                let run_data = &self.data[block.data_start_offset + BITMAP_BYTES..];
-                Self::for_each_run_span(bitmap, block_len, |run_idx, run_start, run_end| {
-                    if run_end <= in_block_start || run_start >= in_block_end {
-                        return;
+                let bitmap = &data[block.data_start_offset..block.data_start_offset + BITMAP_BYTES];
+                let run_data = &data[block.data_start_offset + BITMAP_BYTES..];
+                let bit_unpacker = block.bit_unpacker;
+                let mut run_idx = rank_ones_inclusive(bitmap, in_block_start) - 1;
+                let mut cur_start = in_block_start;
+                let mut cur_val = if gcd == 1 {
+                    block_base.wrapping_add(bit_unpacker.get(run_idx, run_data))
+                } else {
+                    block_base.wrapping_add(gcd.wrapping_mul(bit_unpacker.get(run_idx, run_data)))
+                };
+
+                // Scan only bitmap bits strictly inside `(in_block_start..in_block_end)`.
+                let first_scan_pos = in_block_start + 1;
+                if first_scan_pos < in_block_end {
+                    let start_word = first_scan_pos >> 6;
+                    let end_word = (in_block_end - 1) >> 6;
+                    for word_idx in start_word..=end_word {
+                        let base_bit = word_idx * 64;
+                        let mut word = u64::from_le_bytes(
+                            bitmap[word_idx * 8..word_idx * 8 + 8].try_into().unwrap(),
+                        );
+                        if word_idx == start_word {
+                            let shift = first_scan_pos & 63;
+                            word &= u64::MAX << shift;
+                        }
+                        if word_idx == end_word {
+                            let end_in_word = in_block_end - base_bit;
+                            if end_in_word < 64 {
+                                word &= (1u64 << end_in_word) - 1;
+                            }
+                        }
+                        while word != 0 {
+                            let bit = word.trailing_zeros() as usize;
+                            let next_run_pos = base_bit + bit;
+                            out_slice[cur_start - in_block_start..next_run_pos - in_block_start]
+                                .fill(cur_val);
+                            cur_start = next_run_pos;
+                            run_idx += 1;
+                            let offset_val = bit_unpacker.get(run_idx, run_data);
+                            cur_val = if gcd == 1 {
+                                block_base.wrapping_add(offset_val)
+                            } else {
+                                block_base.wrapping_add(gcd.wrapping_mul(offset_val))
+                            };
+                            word &= word - 1;
+                        }
                     }
-                    let clipped_start = run_start.max(in_block_start) - in_block_start;
-                    let clipped_end = run_end.min(in_block_end) - in_block_start;
-                    let val =
-                        self.decode_norm(block.min_val + block.bit_unpacker.get(run_idx, run_data));
-                    out_slice[clipped_start..clipped_end].fill(val);
-                });
+                }
+                out_slice[cur_start - in_block_start..in_block_end - in_block_start].fill(cur_val);
             }
 
             pos += take as u32;

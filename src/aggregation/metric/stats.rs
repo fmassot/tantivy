@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use columnar::{Column, ColumnType};
+use columnar::{Column, ColumnType, MonotonicallyMappableToU64};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -8,7 +8,9 @@ use crate::aggregation::agg_data::AggregationsSegmentCtx;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
 };
-use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
+use crate::aggregation::segment_agg_result::{
+    collect_multiple_fallback, is_strictly_increasing, SegmentAggregationCollector,
+};
 use crate::aggregation::*;
 use crate::TantivyError;
 
@@ -336,12 +338,75 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
                 self.missing_u64,
             );
         }
-        collect_stats_slice::<COLUMN_TYPE_ID>(
+        collect_stats_slice_for_type::<COLUMN_TYPE_ID>(
             &mut self.buckets[parent_bucket_id as usize],
             agg_data.column_block_accessor.values(),
             self.is_number_or_date_type,
+            self.collecting_for,
         );
 
+        Ok(())
+    }
+
+    fn collect_multiple(
+        &mut self,
+        bucket_ids: &[BucketId],
+        docs: &[crate::DocId],
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        debug_assert_eq!(bucket_ids.len(), docs.len());
+        if docs.is_empty() {
+            return Ok(());
+        }
+        if !is_strictly_increasing(docs) {
+            return collect_multiple_fallback(self, bucket_ids, docs, agg_data);
+        }
+        if let Some(column_source) = &mut self.column_opt {
+            agg_data
+                .column_block_accessor
+                .fetch_block_with_missing_ordered(docs, column_source, self.missing_u64, true);
+        } else {
+            agg_data
+                .column_block_accessor
+                .fetch_block_with_missing_ordered(
+                    docs,
+                    &mut *self.accessor,
+                    self.missing_u64,
+                    true,
+                );
+        }
+        let col_block_accessor = &agg_data.column_block_accessor;
+        let vals = col_block_accessor.values();
+        if col_block_accessor.cardinality().is_full() {
+            if self.is_number_or_date_type {
+                for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                    self.buckets[bucket_id as usize].collect(convert_to_f64::<COLUMN_TYPE_ID>(val));
+                }
+            } else {
+                for &bucket_id in bucket_ids {
+                    self.buckets[bucket_id as usize].collect(0.0);
+                }
+            }
+        } else {
+            let fetched_docs = col_block_accessor.docids();
+            let mut doc_pos = 0usize;
+            if self.is_number_or_date_type {
+                for (&doc, &val) in fetched_docs.iter().zip(vals.iter()) {
+                    while docs[doc_pos] < doc {
+                        doc_pos += 1;
+                    }
+                    self.buckets[bucket_ids[doc_pos] as usize]
+                        .collect(convert_to_f64::<COLUMN_TYPE_ID>(val));
+                }
+            } else {
+                for &doc in fetched_docs {
+                    while docs[doc_pos] < doc {
+                        doc_pos += 1;
+                    }
+                    self.buckets[bucket_ids[doc_pos] as usize].collect(0.0);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -401,6 +466,93 @@ fn two_sum(a: f64, b: f64) -> (f64, f64) {
     let b_rounded = s - a;
     let e = (a - (s - b_rounded)) + (b - b_rounded);
     (s, e)
+}
+
+/// Fast integer-specialized block aggregation for `Sum`, `Average`, `Min`, `Max`, and `Count`.
+///
+/// Falls back to `collect_stats_slice` (4-lane Kahan summation) for `F64` columns or full `Stats`.
+#[inline]
+fn collect_stats_slice_for_type<const COLUMN_TYPE_ID: u8>(
+    stats: &mut IntermediateStats,
+    vals: &[u64],
+    is_number_or_date_type: bool,
+    collecting_for: StatsType,
+) {
+    if vals.is_empty() {
+        return;
+    }
+    const I64_ID: u8 = ColumnType::I64 as u8;
+    const U64_ID: u8 = ColumnType::U64 as u8;
+    const DATE_ID: u8 = ColumnType::DateTime as u8;
+
+    match collecting_for {
+        StatsType::Count => {
+            stats.count += vals.len() as u64;
+            return;
+        }
+        StatsType::Min
+            if is_number_or_date_type && matches!(COLUMN_TYPE_ID, I64_ID | U64_ID | DATE_ID) =>
+        {
+            // Fast-field u64 encodings for I64/U64/DateTime are order-preserving, so raw u64::min
+            // finds the exact minimum with SIMD integer comparisons and zero f64 conversion/Kahan.
+            let mut min_raw = vals[0];
+            for &val in &vals[1..] {
+                if val < min_raw {
+                    min_raw = val;
+                }
+            }
+            stats.count += vals.len() as u64;
+            stats.min = stats.min.min(convert_to_f64::<COLUMN_TYPE_ID>(min_raw));
+            return;
+        }
+        StatsType::Max
+            if is_number_or_date_type && matches!(COLUMN_TYPE_ID, I64_ID | U64_ID | DATE_ID) =>
+        {
+            let mut max_raw = vals[0];
+            for &val in &vals[1..] {
+                if val > max_raw {
+                    max_raw = val;
+                }
+            }
+            stats.count += vals.len() as u64;
+            stats.max = stats.max.max(convert_to_f64::<COLUMN_TYPE_ID>(max_raw));
+            return;
+        }
+        StatsType::Sum | StatsType::Average
+            if is_number_or_date_type && matches!(COLUMN_TYPE_ID, I64_ID | U64_ID) =>
+        {
+            // Exact i128/u128 block accumulation: faster than 4-lane f64 Kahan and exact.
+            // Split into an exact 106-bit (hi, lo) f64 pair before folding via `merge_fruits`.
+            let (hi, lo) = if COLUMN_TYPE_ID == I64_ID {
+                let mut block_sum: i128 = 0;
+                for &val in vals {
+                    block_sum += i64::from_u64(val) as i128;
+                }
+                let hi = block_sum as f64;
+                let lo = (block_sum - hi as i128) as f64;
+                (hi, lo)
+            } else {
+                let mut block_sum: u128 = 0;
+                for &val in vals {
+                    block_sum += val as u128;
+                }
+                let hi = block_sum as f64;
+                let lo = (block_sum as i128 - hi as i128) as f64;
+                (hi, lo)
+            };
+            stats.merge_fruits(IntermediateStats {
+                count: vals.len() as u64,
+                sum: hi,
+                delta: -lo,
+                min: f64::MAX,
+                max: f64::MIN,
+            });
+            return;
+        }
+        _ => {}
+    }
+
+    collect_stats_slice::<COLUMN_TYPE_ID>(stats, vals, is_number_or_date_type);
 }
 
 /// Collects a block of values into `LANES` independent Kahan accumulators merged back into
