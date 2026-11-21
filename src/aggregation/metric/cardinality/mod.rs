@@ -191,6 +191,13 @@ impl CardinalityCollector {
         }
     }
 
+    fn from_sketch(sketch: HllSketch, salt: u8) -> Self {
+        Self {
+            state: CardinalityState::Sketch(sketch),
+            salt,
+        }
+    }
+
     /// Insert a value into the HLL sketch, salted by the column type.
     /// The salt ensures that identical u64 values from different column types
     /// (e.g. bool `false` vs i64 `0`) are counted as distinct.

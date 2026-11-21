@@ -12,11 +12,11 @@ use std::fmt::Debug;
 use std::io;
 
 use columnar::ColumnType;
-use datasketches::hll::Coupon;
+use datasketches::hll::{Coupon, HllSketch, HllType};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use super::term_ord_accumulator::TermOrdAccumulator;
-use super::{CardinalityAggReqData, CardinalityCollector};
+use super::{CardinalityAggReqData, CardinalityCollector, LG_K};
 use crate::aggregation::agg_data::AggregationsSegmentCtx;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
@@ -154,18 +154,7 @@ fn build_coupon_cache<S: TermOrdAccumulator>(
 
     // Regardless of whether or not there is effectively a missing value in one of the buckets,
     // we populate the cache with the missing key too (if any).
-    let missing_coupon_opt: Option<Coupon> = missing_value_opt.map(|missing_key| {
-        if let Key::Str(missing_value_str) = missing_key {
-            Coupon::from_value(missing_value_str.as_bytes())
-        } else {
-            // See https://github.com/quickwit-oss/tantivy/issues/2891
-            // A missing key with a type different from Str will not work as intended
-            // for the moment.
-            //
-            // Right now this is just a partial workaround.
-            Coupon::from_value("__tantivy_missing_non_str__".as_bytes())
-        }
-    });
+    let missing_coupon_opt: Option<Coupon> = missing_value_opt.map(missing_coupon_for_key);
     Ok(CouponCache::new(term_ords, coupons, missing_coupon_opt))
 }
 
@@ -224,6 +213,11 @@ fn missing_coupon_for_key(missing_key: &Key) -> Coupon {
     if let Key::Str(missing_value_str) = missing_key {
         Coupon::from_value(missing_value_str.as_bytes())
     } else {
+        // See https://github.com/quickwit-oss/tantivy/issues/2891
+        // A missing key with a type different from Str will not work as intended
+        // for the moment.
+        //
+        // Right now this is just a partial workaround.
         Coupon::from_value("__tantivy_missing_non_str__".as_bytes())
     }
 }
@@ -256,24 +250,38 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                     "the same bucket should not be finalized twice.".to_string(),
                 ));
             };
-            let mut cardinality = CardinalityCollector::new(ColumnType::Str as u8);
-            let mut ords: Vec<u64> = Vec::with_capacity(term_ords.len());
-            ords.extend(term_ords.iter_ords());
-            if !term_ords.is_iter_sorted() {
-                ords.sort_unstable();
-            }
-            let had_missing = ords
-                .pop_if(|highest_term_ord| *highest_term_ord >= term_dictionary.num_terms())
-                .is_some();
-            let all_found = term_dictionary.sorted_ords_to_term_cb(&ords, &mut |term_bytes| {
-                cardinality.insert_coupon(Coupon::from_value(term_bytes));
-            })?;
-            assert!(all_found);
-            if had_missing {
-                if let Some(missing_key) = req_data.req.missing.as_ref() {
-                    cardinality.insert_coupon(missing_coupon_for_key(missing_key));
+            let mut sketch =
+                HllSketch::new(LG_K, HllType::Hll8).expect("LG_K is within the supported range");
+            let dict_num_terms = term_dictionary.num_terms();
+            if req_data.missing_value_for_accessor.is_none()
+                && term_ords.len() as u64 == dict_num_terms
+            {
+                // Every term in the dictionary was hit and no missing sentinel can be present:
+                // stream the SSTable directly without materializing a Vec<u64> of ordinals.
+                term_dictionary.stream_all_terms_cb(&mut |term_bytes| {
+                    sketch.update_with_coupon(Coupon::from_value(term_bytes));
+                })?;
+            } else {
+                let mut ords: Vec<u64> = Vec::with_capacity(term_ords.len());
+                ords.extend(term_ords.iter_ords());
+                if !term_ords.is_iter_sorted() {
+                    ords.sort_unstable();
+                }
+                let had_missing = ords
+                    .pop_if(|highest_term_ord| *highest_term_ord >= dict_num_terms)
+                    .is_some();
+                let all_found =
+                    term_dictionary.sorted_ords_to_term_cb(&ords, &mut |term_bytes| {
+                        sketch.update_with_coupon(Coupon::from_value(term_bytes));
+                    })?;
+                assert!(all_found);
+                if had_missing {
+                    if let Some(missing_key) = req_data.req.missing.as_ref() {
+                        sketch.update_with_coupon(missing_coupon_for_key(missing_key));
+                    }
                 }
             }
+            let cardinality = CardinalityCollector::from_sketch(sketch, ColumnType::Str as u8);
             results.push(
                 name,
                 IntermediateAggregationResult::Metric(IntermediateMetricResult::Cardinality(

@@ -418,10 +418,22 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
 
     fn get_vals(&self, docs: &[RowId], output: &mut [u64]) {
         debug_assert_eq!(docs.len(), output.len());
+        let len = docs.len();
+        if len >= 4 {
+            let first = docs[0];
+            if docs[len - 1] == first.wrapping_add((len - 1) as u32)
+                && docs
+                    .iter()
+                    .enumerate()
+                    .all(|(idx, &doc)| doc == first.wrapping_add(idx as u32))
+            {
+                self.get_range(first as u64, output);
+                return;
+            }
+        }
         let min_value = self.stats.min_value;
         let gcd = self.stats.gcd.get();
         let data = self.data.as_slice();
-        let len = docs.len();
         let mut i = 0usize;
 
         while i < len {
@@ -430,29 +442,30 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
             let block_base = min_value.wrapping_add(gcd.wrapping_mul(block.min_val));
             let bit_unpacker = block.bit_unpacker;
 
+            let mut block_end = i + 1;
+            while block_end < len && (docs[block_end] >> 8) as usize == block_id {
+                block_end += 1;
+            }
+            let block_docs = &docs[i..block_end];
+            let block_out = &mut output[i..block_end];
+            i = block_end;
+
             if bit_unpacker.bit_width() == 0 {
-                while i < len && (docs[i] >> 8) as usize == block_id {
-                    output[i] = block_base;
-                    i += 1;
-                }
+                block_out.fill(block_base);
                 continue;
             }
 
             if block.num_runs == BLOCK_SIZE as u16 {
                 let run_data = &data[block.data_start_offset..];
                 if gcd == 1 {
-                    while i < len && (docs[i] >> 8) as usize == block_id {
-                        let in_block = docs[i] & 255;
-                        let offset_val = bit_unpacker.get(in_block, run_data);
-                        output[i] = block_base.wrapping_add(offset_val);
-                        i += 1;
+                    for (&doc, out_slot) in block_docs.iter().zip(block_out.iter_mut()) {
+                        let offset_val = bit_unpacker.get(doc & 255, run_data);
+                        *out_slot = block_base.wrapping_add(offset_val);
                     }
                 } else {
-                    while i < len && (docs[i] >> 8) as usize == block_id {
-                        let in_block = docs[i] & 255;
-                        let offset_val = bit_unpacker.get(in_block, run_data);
-                        output[i] = block_base.wrapping_add(gcd.wrapping_mul(offset_val));
-                        i += 1;
+                    for (&doc, out_slot) in block_docs.iter().zip(block_out.iter_mut()) {
+                        let offset_val = bit_unpacker.get(doc & 255, run_data);
+                        *out_slot = block_base.wrapping_add(gcd.wrapping_mul(offset_val));
                     }
                 }
                 continue;
@@ -474,8 +487,8 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
             let mut prev_run_idx = u32::MAX;
             let mut prev_val = 0u64;
             if gcd == 1 {
-                while i < len && (docs[i] >> 8) as usize == block_id {
-                    let in_block = (docs[i] & 255) as usize;
+                for (&doc, out_slot) in block_docs.iter().zip(block_out.iter_mut()) {
+                    let in_block = (doc & 255) as usize;
                     let word_idx = in_block >> 6;
                     let bit_idx = in_block & 63;
                     let mask = u64::MAX >> (63 - bit_idx);
@@ -484,12 +497,11 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
                         prev_run_idx = run_idx;
                         prev_val = block_base.wrapping_add(bit_unpacker.get(run_idx, run_data));
                     }
-                    output[i] = prev_val;
-                    i += 1;
+                    *out_slot = prev_val;
                 }
             } else {
-                while i < len && (docs[i] >> 8) as usize == block_id {
-                    let in_block = (docs[i] & 255) as usize;
+                for (&doc, out_slot) in block_docs.iter().zip(block_out.iter_mut()) {
+                    let in_block = (doc & 255) as usize;
                     let word_idx = in_block >> 6;
                     let bit_idx = in_block & 63;
                     let mask = u64::MAX >> (63 - bit_idx);
@@ -499,8 +511,7 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
                         let offset_val = bit_unpacker.get(run_idx, run_data);
                         prev_val = block_base.wrapping_add(gcd.wrapping_mul(offset_val));
                     }
-                    output[i] = prev_val;
-                    i += 1;
+                    *out_slot = prev_val;
                 }
             }
         }
@@ -579,8 +590,13 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
                         while word != 0 {
                             let bit = word.trailing_zeros() as usize;
                             let next_run_pos = base_bit + bit;
-                            out_slice[cur_start - in_block_start..next_run_pos - in_block_start]
-                                .fill(cur_val);
+                            let run_start = cur_start - in_block_start;
+                            let run_end = next_run_pos - in_block_start;
+                            if run_end == run_start + 1 {
+                                out_slice[run_start] = cur_val;
+                            } else {
+                                out_slice[run_start..run_end].fill(cur_val);
+                            }
                             cur_start = next_run_pos;
                             run_idx += 1;
                             let offset_val = bit_unpacker.get(run_idx, run_data);
@@ -593,11 +609,29 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
                         }
                     }
                 }
-                out_slice[cur_start - in_block_start..in_block_end - in_block_start].fill(cur_val);
+                let tail_start = cur_start - in_block_start;
+                let tail_end = in_block_end - in_block_start;
+                if tail_end == tail_start + 1 {
+                    out_slice[tail_start] = cur_val;
+                } else {
+                    out_slice[tail_start..tail_end].fill(cur_val);
+                }
             }
 
             pos += take as u32;
             written += take;
+        }
+    }
+
+    fn get_vals_opt(&self, indexes: &[u32], output: &mut [Option<u64>]) {
+        assert_eq!(indexes.len(), output.len());
+        let mut buf = [0u64; 64];
+        for (idx_chunk, out_chunk) in indexes.chunks(64).zip(output.chunks_mut(64)) {
+            let chunk_len = idx_chunk.len();
+            self.get_vals(idx_chunk, &mut buf[..chunk_len]);
+            for (out_slot, &val) in out_chunk.iter_mut().zip(&buf[..chunk_len]) {
+                *out_slot = Some(val);
+            }
         }
     }
 

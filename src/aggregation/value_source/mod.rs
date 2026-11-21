@@ -119,6 +119,14 @@ pub trait ValueSourceDictionary {
         sorted_ords: &[u64],
         callback: &mut dyn FnMut(&[u8]),
     ) -> io::Result<bool>;
+
+    /// Calls `callback` with every term in the dictionary in ascending ordinal order.
+    fn stream_all_terms_cb(&self, callback: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+        let all_ords: Vec<u64> = (0..self.num_terms()).collect();
+        let all_found = self.sorted_ords_to_term_cb(&all_ords, callback)?;
+        debug_assert!(all_found);
+        Ok(())
+    }
 }
 
 impl ValueSourceDictionary for Dictionary {
@@ -132,6 +140,10 @@ impl ValueSourceDictionary for Dictionary {
         callback: &mut dyn FnMut(&[u8]),
     ) -> io::Result<bool> {
         Dictionary::sorted_ords_to_term_cb(self, sorted_ords, callback)
+    }
+
+    fn stream_all_terms_cb(&self, callback: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+        Dictionary::stream_all_terms_cb(self, callback)
     }
 }
 

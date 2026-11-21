@@ -61,6 +61,8 @@ pub(crate) struct MetricAggReqData {
     pub(crate) missing: Option<f64>,
     /// The name of the aggregation.
     pub(crate) name: String,
+    /// Source field name (used to share opened physical column instances across sibling metrics).
+    pub(crate) field_name: String,
 }
 
 impl MetricAggReqData {

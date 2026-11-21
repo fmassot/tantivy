@@ -338,7 +338,7 @@ pub struct IndexMeta {
     pub payload: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug)]
 struct UntrackedIndexMeta {
     pub segments: Vec<InnerSegmentMeta>,
     #[serde(default)]
@@ -349,6 +349,37 @@ struct UntrackedIndexMeta {
     pub opstamp: Opstamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<String>,
+}
+
+/// A parsed, immutable snapshot of `meta.json` that can be cached across repeated opens of
+/// immutable read-only directories (such as cloud-backed splits) to avoid re-parsing `meta.json`
+/// and `Schema` on every request.
+#[derive(Clone, Debug)]
+pub struct IndexMetaSnapshot(UntrackedIndexMeta);
+
+impl IndexMetaSnapshot {
+    /// Deserializes `meta.json` into a reusable snapshot.
+    pub fn deserialize(meta_json: &str) -> serde_json::Result<Self> {
+        let untracked: UntrackedIndexMeta = serde_json::from_str(meta_json)?;
+        Ok(Self(untracked))
+    }
+
+    pub(crate) fn track(&self, inventory: &SegmentMetaInventory) -> IndexMeta {
+        self.0.clone().track(inventory)
+    }
+
+    pub(crate) fn searchable_segment_metas(
+        &self,
+        inventory: &SegmentMetaInventory,
+    ) -> Vec<SegmentMeta> {
+        self.0
+            .segments
+            .iter()
+            .filter(|seg| seg.max_doc > seg.deletes.as_ref().map_or(0, |d| d.num_deleted_docs))
+            .cloned()
+            .map(|inner| inner.track(inventory))
+            .collect()
+    }
 }
 
 impl UntrackedIndexMeta {

@@ -209,9 +209,96 @@ pub enum StatsType {
     Percentiles,
 }
 
+/// Persistent exact integer accumulator per bucket for `I64`/`U64` columns in `collect_multiple`.
+///
+/// Folded into `IntermediateStats` only at finalization (`add_intermediate_aggregation_result`)
+/// or on-demand in `compute_metric_value`, avoiding per-block stack zeroing, `i128 -> f64`
+/// conversions (`__floattidf`), and Kahan floating-point chains.
+#[derive(Clone, Copy, Debug)]
+struct IntStatsBucket {
+    count: u64,
+    sum: i128,
+    min_raw: u64,
+    max_raw: u64,
+}
+
+impl Default for IntStatsBucket {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            count: 0,
+            sum: 0,
+            min_raw: u64::MAX,
+            max_raw: 0,
+        }
+    }
+}
+
+impl IntStatsBucket {
+    #[inline]
+    fn to_intermediate_stats<const COLUMN_TYPE_ID: u8>(
+        self,
+        collecting_for: StatsType,
+    ) -> IntermediateStats {
+        if self.count == 0 {
+            return IntermediateStats::default();
+        }
+        let (sum, delta) = match collecting_for {
+            StatsType::Sum | StatsType::Average | StatsType::Stats => {
+                let hi = self.sum as f64;
+                let lo = (self.sum - hi as i128) as f64;
+                (hi, -lo)
+            }
+            _ => (0.0, 0.0),
+        };
+        let min = match collecting_for {
+            StatsType::Min | StatsType::Stats => convert_to_f64::<COLUMN_TYPE_ID>(self.min_raw),
+            _ => f64::MAX,
+        };
+        let max = match collecting_for {
+            StatsType::Max | StatsType::Stats => convert_to_f64::<COLUMN_TYPE_ID>(self.max_raw),
+            _ => f64::MIN,
+        };
+        IntermediateStats {
+            count: self.count,
+            sum,
+            delta,
+            min,
+            max,
+        }
+    }
+}
+
+fn can_use_i64_block_sum(req: &MetricAggReqData) -> bool {
+    const MAX_SAFE_I64: i64 = 1i64 << 46;
+    const MAX_SAFE_U64: u64 = 1u64 << 47;
+    let Some((min_u64, max_u64)) = req.accessor.bounds() else {
+        return false;
+    };
+    match req.accessor.column_type() {
+        ColumnType::I64 => {
+            let min_val = i64::from_u64(min_u64);
+            let max_val = i64::from_u64(max_u64);
+            let missing_ok = req.missing_u64.map_or(true, |missing| {
+                let missing_i64 = i64::from_u64(missing);
+                missing_i64 >= -MAX_SAFE_I64 && missing_i64 <= MAX_SAFE_I64
+            });
+            min_val >= -MAX_SAFE_I64 && max_val <= MAX_SAFE_I64 && missing_ok
+        }
+        ColumnType::U64 => {
+            let missing_ok = req
+                .missing_u64
+                .map_or(true, |missing| missing <= MAX_SAFE_U64);
+            max_u64 <= MAX_SAFE_U64 && missing_ok
+        }
+        _ => false,
+    }
+}
+
 fn create_collector<const TYPE_ID: u8>(
     req: MetricAggReqData,
 ) -> Box<dyn SegmentAggregationCollector> {
+    let can_use_fast_int_sum = can_use_i64_block_sum(&req);
     let column_opt = req
         .accessor
         .as_physical_column()
@@ -220,10 +307,12 @@ fn create_collector<const TYPE_ID: u8>(
         name: req.name,
         collecting_for: req.collecting_for,
         is_number_or_date_type: req.is_number_or_date_type,
+        can_use_fast_int_sum,
         missing_u64: req.missing_u64,
         column_opt,
         accessor: req.accessor,
         buckets: vec![IntermediateStats::default()],
+        int_buckets: Vec::new(),
     })
 }
 
@@ -255,9 +344,28 @@ pub(crate) struct SegmentStatsCollector<const COLUMN_TYPE_ID: u8> {
     /// measurable.
     pub(crate) column_opt: Option<(Column<u64>, ColumnType)>,
     pub(crate) is_number_or_date_type: bool,
+    /// True when column bounds (and `missing_u64`, if any) guarantee that summing up to 65,536
+    /// values in a native `i64`/`u64` cannot overflow, enabling AVX2-vectorizable integer sums.
+    can_use_fast_int_sum: bool,
     pub(crate) buckets: Vec<IntermediateStats>,
+    int_buckets: Vec<IntStatsBucket>,
     pub(crate) name: String,
     pub(crate) collecting_for: StatsType,
+}
+
+impl<const COLUMN_TYPE_ID: u8> SegmentStatsCollector<COLUMN_TYPE_ID> {
+    #[inline]
+    fn merged_bucket_stats(&self, bucket_id: usize) -> Option<IntermediateStats> {
+        let mut stats = *self.buckets.get(bucket_id)?;
+        if let Some(&int_bucket) = self.int_buckets.get(bucket_id) {
+            if int_bucket.count > 0 {
+                stats.merge_fruits(
+                    int_bucket.to_intermediate_stats::<COLUMN_TYPE_ID>(self.collecting_for),
+                );
+            }
+        }
+        Some(stats)
+    }
 }
 
 impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
@@ -273,7 +381,9 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         let name = self.name.clone();
 
         self.prepare_max_bucket(parent_bucket_id, agg_data)?;
-        let stats = self.buckets[parent_bucket_id as usize];
+        let stats = self
+            .merged_bucket_stats(parent_bucket_id as usize)
+            .unwrap_or_default();
         let intermediate_metric_result = match self.collecting_for {
             StatsType::Average => {
                 IntermediateMetricResult::Average(IntermediateAverage::from_stats(stats))
@@ -318,6 +428,13 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         // below, which is semantically identical.
         // TODO: remove once we fetch all values for all bucket ids in one go
         if let Some(column_source) = &mut self.column_opt {
+            if matches!(self.collecting_for, StatsType::Count)
+                && self.missing_u64.is_none()
+                && column_source.0.index.get_cardinality().is_full()
+            {
+                self.buckets[parent_bucket_id as usize].count += docs.len() as u64;
+                return Ok(());
+            }
             if docs.len() == 1 && self.missing_u64.is_none() {
                 collect_stats::<COLUMN_TYPE_ID>(
                     &mut self.buckets[parent_bucket_id as usize],
@@ -343,6 +460,7 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
             agg_data.column_block_accessor.values(),
             self.is_number_or_date_type,
             self.collecting_for,
+            self.can_use_fast_int_sum,
         );
 
         Ok(())
@@ -379,9 +497,13 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         let vals = col_block_accessor.values();
         if col_block_accessor.cardinality().is_full() {
             if self.is_number_or_date_type {
-                for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
-                    self.buckets[bucket_id as usize].collect(convert_to_f64::<COLUMN_TYPE_ID>(val));
-                }
+                collect_multiple_full_for_type::<COLUMN_TYPE_ID>(
+                    &mut self.buckets,
+                    &mut self.int_buckets,
+                    bucket_ids,
+                    vals,
+                    self.collecting_for,
+                );
             } else {
                 for &bucket_id in bucket_ids {
                     self.buckets[bucket_id as usize].collect(0.0);
@@ -420,6 +542,10 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
             self.buckets
                 .resize_with(required_buckets, IntermediateStats::default);
         }
+        if !self.int_buckets.is_empty() && self.int_buckets.len() < required_buckets {
+            self.int_buckets
+                .resize_with(required_buckets, IntStatsBucket::default);
+        }
         Ok(())
     }
 
@@ -433,7 +559,7 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         if self.name != sub_agg_name {
             return None;
         }
-        let stats = self.buckets.get(bucket_id as usize)?;
+        let stats = self.merged_bucket_stats(bucket_id as usize)?;
         // The property depends on what we're collecting:
         //   - StatsType::Stats exposes count/sum/min/max/avg via dotted property.
         //   - Single-value kinds (Sum/Count/Min/Max/Average) expect an empty property and return
@@ -477,6 +603,7 @@ fn collect_stats_slice_for_type<const COLUMN_TYPE_ID: u8>(
     vals: &[u64],
     is_number_or_date_type: bool,
     collecting_for: StatsType,
+    can_use_fast_int_sum: bool,
 ) {
     if vals.is_empty() {
         return;
@@ -521,21 +648,41 @@ fn collect_stats_slice_for_type<const COLUMN_TYPE_ID: u8>(
         StatsType::Sum | StatsType::Average
             if is_number_or_date_type && matches!(COLUMN_TYPE_ID, I64_ID | U64_ID) =>
         {
-            // Exact i128/u128 block accumulation: faster than 4-lane f64 Kahan and exact.
+            // Exact integer block accumulation: uses SIMD-vectorizable native i64/u64 when column
+            // bounds guarantee zero overflow for blocks <= 65,536 elements, otherwise i128/u128.
             // Split into an exact 106-bit (hi, lo) f64 pair before folding via `merge_fruits`.
+            let use_native_int = can_use_fast_int_sum && vals.len() <= 65_536;
             let (hi, lo) = if COLUMN_TYPE_ID == I64_ID {
-                let mut block_sum: i128 = 0;
-                for &val in vals {
-                    block_sum += i64::from_u64(val) as i128;
-                }
+                let block_sum: i128 = if use_native_int {
+                    let mut sum_i64: i64 = 0;
+                    for &val in vals {
+                        sum_i64 = sum_i64.wrapping_add(i64::from_u64(val));
+                    }
+                    sum_i64 as i128
+                } else {
+                    let mut sum_i128: i128 = 0;
+                    for &val in vals {
+                        sum_i128 += i64::from_u64(val) as i128;
+                    }
+                    sum_i128
+                };
                 let hi = block_sum as f64;
                 let lo = (block_sum - hi as i128) as f64;
                 (hi, lo)
             } else {
-                let mut block_sum: u128 = 0;
-                for &val in vals {
-                    block_sum += val as u128;
-                }
+                let block_sum: u128 = if use_native_int {
+                    let mut sum_u64: u64 = 0;
+                    for &val in vals {
+                        sum_u64 = sum_u64.wrapping_add(val);
+                    }
+                    sum_u64 as u128
+                } else {
+                    let mut sum_u128: u128 = 0;
+                    for &val in vals {
+                        sum_u128 += val as u128;
+                    }
+                    sum_u128
+                };
                 let hi = block_sum as f64;
                 let lo = (block_sum as i128 - hi as i128) as f64;
                 (hi, lo)
@@ -549,10 +696,189 @@ fn collect_stats_slice_for_type<const COLUMN_TYPE_ID: u8>(
             });
             return;
         }
+        StatsType::Stats if is_number_or_date_type && matches!(COLUMN_TYPE_ID, I64_ID | U64_ID) => {
+            let use_native_int = can_use_fast_int_sum && vals.len() <= 65_536;
+            let mut min_raw = vals[0];
+            let mut max_raw = vals[0];
+            let (hi, lo) = if COLUMN_TYPE_ID == I64_ID {
+                let block_sum: i128 = if use_native_int {
+                    let mut sum_i64: i64 = 0;
+                    for &val in vals {
+                        if val < min_raw {
+                            min_raw = val;
+                        }
+                        if val > max_raw {
+                            max_raw = val;
+                        }
+                        sum_i64 = sum_i64.wrapping_add(i64::from_u64(val));
+                    }
+                    sum_i64 as i128
+                } else {
+                    let mut sum_i128: i128 = 0;
+                    for &val in vals {
+                        if val < min_raw {
+                            min_raw = val;
+                        }
+                        if val > max_raw {
+                            max_raw = val;
+                        }
+                        sum_i128 += i64::from_u64(val) as i128;
+                    }
+                    sum_i128
+                };
+                let hi = block_sum as f64;
+                let lo = (block_sum - hi as i128) as f64;
+                (hi, lo)
+            } else {
+                let block_sum: u128 = if use_native_int {
+                    let mut sum_u64: u64 = 0;
+                    for &val in vals {
+                        if val < min_raw {
+                            min_raw = val;
+                        }
+                        if val > max_raw {
+                            max_raw = val;
+                        }
+                        sum_u64 = sum_u64.wrapping_add(val);
+                    }
+                    sum_u64 as u128
+                } else {
+                    let mut sum_u128: u128 = 0;
+                    for &val in vals {
+                        if val < min_raw {
+                            min_raw = val;
+                        }
+                        if val > max_raw {
+                            max_raw = val;
+                        }
+                        sum_u128 += val as u128;
+                    }
+                    sum_u128
+                };
+                let hi = block_sum as f64;
+                let lo = (block_sum as i128 - hi as i128) as f64;
+                (hi, lo)
+            };
+            stats.merge_fruits(IntermediateStats {
+                count: vals.len() as u64,
+                sum: hi,
+                delta: -lo,
+                min: convert_to_f64::<COLUMN_TYPE_ID>(min_raw),
+                max: convert_to_f64::<COLUMN_TYPE_ID>(max_raw),
+            });
+            return;
+        }
         _ => {}
     }
 
     collect_stats_slice::<COLUMN_TYPE_ID>(stats, vals, is_number_or_date_type);
+}
+
+/// Fast integer-specialized multi-bucket block aggregation for `collect_multiple` on full columns.
+///
+/// Accumulates directly into persistent `int_buckets` (zero stack zeroing, zero per-block
+/// `i128 -> f64` conversion, zero Kahan chains), folding into `IntermediateStats` only once at
+/// segment finalization.
+#[inline]
+fn collect_multiple_full_for_type<const COLUMN_TYPE_ID: u8>(
+    buckets: &mut [IntermediateStats],
+    int_buckets: &mut Vec<IntStatsBucket>,
+    bucket_ids: &[BucketId],
+    vals: &[u64],
+    collecting_for: StatsType,
+) {
+    const I64_ID: u8 = ColumnType::I64 as u8;
+    const U64_ID: u8 = ColumnType::U64 as u8;
+    const DATE_ID: u8 = ColumnType::DateTime as u8;
+
+    if matches!(collecting_for, StatsType::Count) {
+        for &bucket_id in bucket_ids {
+            buckets[bucket_id as usize].count += 1;
+        }
+        return;
+    }
+
+    let use_int = match collecting_for {
+        StatsType::Min | StatsType::Max => matches!(COLUMN_TYPE_ID, I64_ID | U64_ID | DATE_ID),
+        StatsType::Sum | StatsType::Average | StatsType::Stats => {
+            matches!(COLUMN_TYPE_ID, I64_ID | U64_ID)
+        }
+        _ => false,
+    };
+
+    if use_int {
+        if int_buckets.len() < buckets.len() {
+            int_buckets.resize_with(buckets.len(), IntStatsBucket::default);
+        }
+        match collecting_for {
+            StatsType::Min => {
+                for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                    let slot = &mut int_buckets[bucket_id as usize];
+                    slot.count += 1;
+                    if val < slot.min_raw {
+                        slot.min_raw = val;
+                    }
+                }
+            }
+            StatsType::Max => {
+                for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                    let slot = &mut int_buckets[bucket_id as usize];
+                    slot.count += 1;
+                    if val > slot.max_raw {
+                        slot.max_raw = val;
+                    }
+                }
+            }
+            StatsType::Sum | StatsType::Average => {
+                if COLUMN_TYPE_ID == I64_ID {
+                    for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                        let slot = &mut int_buckets[bucket_id as usize];
+                        slot.count += 1;
+                        slot.sum += i64::from_u64(val) as i128;
+                    }
+                } else {
+                    for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                        let slot = &mut int_buckets[bucket_id as usize];
+                        slot.count += 1;
+                        slot.sum += val as i128;
+                    }
+                }
+            }
+            StatsType::Stats => {
+                if COLUMN_TYPE_ID == I64_ID {
+                    for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                        let slot = &mut int_buckets[bucket_id as usize];
+                        slot.count += 1;
+                        slot.sum += i64::from_u64(val) as i128;
+                        if val < slot.min_raw {
+                            slot.min_raw = val;
+                        }
+                        if val > slot.max_raw {
+                            slot.max_raw = val;
+                        }
+                    }
+                } else {
+                    for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                        let slot = &mut int_buckets[bucket_id as usize];
+                        slot.count += 1;
+                        slot.sum += val as i128;
+                        if val < slot.min_raw {
+                            slot.min_raw = val;
+                        }
+                        if val > slot.max_raw {
+                            slot.max_raw = val;
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        return;
+    }
+
+    for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+        buckets[bucket_id as usize].collect(convert_to_f64::<COLUMN_TYPE_ID>(val));
+    }
 }
 
 /// Collects a block of values into `LANES` independent Kahan accumulators merged back into

@@ -4,9 +4,10 @@ use std::net::Ipv6Addr;
 
 use columnar::column_values::CompactSpaceU64Accessor;
 use columnar::{
-    Column, ColumnType, Dictionary, MonotonicallyMappableToU128, MonotonicallyMappableToU64,
-    NumericalValue, StrColumn,
+    Cardinality, Column, ColumnType, Dictionary, MonotonicallyMappableToU128,
+    MonotonicallyMappableToU64, NumericalValue, StrColumn,
 };
+use fastdivide::DividerU64;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -110,6 +111,65 @@ impl InternalValueRepr {
     }
 }
 
+/// Dense flat counter array for single-source fixed `date_histogram` composite aggregations.
+struct DenseDateBuckets {
+    /// Bucket index (`ts_ns / interval_ns`) corresponding to slot 0.
+    base_bucket_idx: i64,
+    /// Number of slots per parent bucket (`<= 4096`).
+    span: usize,
+    /// One flat counter slice per `parent_bucket_id`.
+    parent_counts: Vec<Vec<u32>>,
+}
+
+/// Pre-validated fast execution strategy for common single-column-per-source composite queries.
+enum CompositeFastPath {
+    /// Single `date_histogram` source with `FixedNanoseconds` interval, single non-multivalued
+    /// column, no `after` cursor, no `missing_bucket`, no sub-aggregations.
+    SingleDateHistogramFixed {
+        column: Column<u64>,
+        is_full: bool,
+        interval_ns: i64,
+        divider: DividerU64,
+        order: Order,
+        /// Optional dense flat counter array per parent bucket when the column's timestamp span
+        /// covers at most 4096 buckets (avoids all hash-map lookups during collection).
+        dense: Option<DenseDateBuckets>,
+    },
+    /// 1..=4 `terms` sources, each backed by a single `Cardinality::Full` column, no `after`
+    /// cursor, no `missing_bucket`, no sub-aggregations. Enables block fetching and top-K
+    /// prefix pruning before reading trailing columns.
+    MultiTermsFull {
+        columns: SmallVec<[Column<u64>; 4]>,
+        orders: SmallVec<[Order; 4]>,
+    },
+    /// General recursive visitor supporting all source types, `after`, `missing_bucket`,
+    /// multivalued/JSON columns, and sub-aggregations.
+    General,
+}
+
+impl Debug for CompositeFastPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompositeFastPath::SingleDateHistogramFixed {
+                is_full,
+                interval_ns,
+                order,
+                ..
+            } => f
+                .debug_struct("SingleDateHistogramFixed")
+                .field("is_full", is_full)
+                .field("interval_ns", interval_ns)
+                .field("order", order)
+                .finish(),
+            CompositeFastPath::MultiTermsFull { orders, .. } => f
+                .debug_struct("MultiTermsFull")
+                .field("orders", orders)
+                .finish(),
+            CompositeFastPath::General => f.write_str("General"),
+        }
+    }
+}
+
 /// The collector puts values from the fast field into the correct buckets and
 /// does a conversion to the correct datatype.
 #[derive(Debug)]
@@ -121,6 +181,8 @@ pub struct SegmentCompositeCollector {
     bucket_id_provider: BucketIdProvider,
     /// Number of sources, needed when creating new DynArrayHeapMaps.
     num_sources: usize,
+    /// Fast path selected once at segment collector construction.
+    fast_path: CompositeFastPath,
 }
 
 impl SegmentAggregationCollector for SegmentCompositeCollector {
@@ -148,24 +210,90 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
         let mem_pre = self.get_memory_consumption(parent_bucket_id);
+        let limit = self.req_data.req.size as usize;
 
-        for doc in docs {
-            let mut visitor = CompositeKeyVisitor {
-                doc_id: *doc,
-                composite_agg_data: &self.req_data,
-                buckets: &mut self.parent_buckets[parent_bucket_id as usize],
-                sub_agg: &mut self.sub_agg,
-                bucket_id_provider: &mut self.bucket_id_provider,
-                sub_level_values: SmallVec::new(),
-            };
-            visitor.visit(0, true)?;
+        match &mut self.fast_path {
+            CompositeFastPath::SingleDateHistogramFixed {
+                column,
+                is_full,
+                interval_ns,
+                divider,
+                order,
+                dense,
+            } => {
+                let accessor = &mut agg_data.column_block_accessor;
+                if *is_full {
+                    accessor.fetch_full_column_block(docs, column.values.as_ref());
+                } else {
+                    let mut col_source = (column.clone(), ColumnType::DateTime);
+                    accessor.fetch_block_with_missing(docs, &mut col_source, None);
+                }
+                let interval_ns = *interval_ns;
+                let interval_u64 = interval_ns as u64;
+                let divider = *divider;
+                let order = *order;
+
+                if let Some(dense_buckets) = dense.as_mut() {
+                    let base = dense_buckets.base_bucket_idx;
+                    let counts = &mut dense_buckets.parent_counts[parent_bucket_id as usize];
+                    for raw_val in accessor.iter_vals() {
+                        let bucket_idx =
+                            compute_fixed_date_bucket_idx(raw_val, interval_ns, divider);
+                        let slot = (bucket_idx - base) as usize;
+                        debug_assert!(slot < counts.len());
+                        counts[slot] += 1;
+                    }
+                    return Ok(());
+                }
+
+                let buckets = &mut self.parent_buckets[parent_bucket_id as usize];
+                let mut vals = accessor.iter_vals();
+                if let Some(first_raw) = vals.next() {
+                    let mut run_bucket =
+                        compute_fixed_date_bucket(first_raw, interval_ns, interval_u64, divider);
+                    let mut run_count: u32 = 1;
+                    for raw_val in vals {
+                        let bucket_val =
+                            compute_fixed_date_bucket(raw_val, interval_ns, interval_u64, divider);
+                        if bucket_val == run_bucket {
+                            run_count += 1;
+                        } else {
+                            let key = [InternalValueRepr::new_histogram(run_bucket, order)];
+                            add_count_to_bucket(limit, buckets, &key, run_count);
+                            run_bucket = bucket_val;
+                            run_count = 1;
+                        }
+                    }
+                    let key = [InternalValueRepr::new_histogram(run_bucket, order)];
+                    add_count_to_bucket(limit, buckets, &key, run_count);
+                }
+            }
+            CompositeFastPath::MultiTermsFull { columns, orders } => {
+                let buckets = &mut self.parent_buckets[parent_bucket_id as usize];
+                collect_multi_terms_full_fast(docs, columns, orders, limit, buckets);
+            }
+            CompositeFastPath::General => {
+                for doc in docs {
+                    let mut visitor = CompositeKeyVisitor {
+                        doc_id: *doc,
+                        composite_agg_data: &self.req_data,
+                        buckets: &mut self.parent_buckets[parent_bucket_id as usize],
+                        sub_agg: &mut self.sub_agg,
+                        bucket_id_provider: &mut self.bucket_id_provider,
+                        sub_level_values: SmallVec::new(),
+                    };
+                    visitor.visit(0, true)?;
+                }
+
+                if let Some(sub_agg) = &mut self.sub_agg {
+                    sub_agg.check_flush_local(agg_data)?;
+                }
+            }
         }
 
-        if let Some(sub_agg) = &mut self.sub_agg {
-            sub_agg.check_flush_local(agg_data)?;
-        }
-
-        let mem_delta = self.get_memory_consumption(parent_bucket_id) - mem_pre;
+        let mem_delta = self
+            .get_memory_consumption(parent_bucket_id)
+            .saturating_sub(mem_pre);
         if mem_delta > 0 {
             agg_data.context.limits.add_memory_consumed(mem_delta)?;
         }
@@ -189,6 +317,17 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
         while self.parent_buckets.len() < required_len {
             let map = DynArrayHeapMap::try_new(self.num_sources)?;
             self.parent_buckets.push(map);
+        }
+        if let CompositeFastPath::SingleDateHistogramFixed {
+            dense: Some(dense_buckets),
+            ..
+        } = &mut self.fast_path
+        {
+            while dense_buckets.parent_counts.len() < required_len {
+                dense_buckets
+                    .parent_counts
+                    .push(vec![0u32; dense_buckets.span]);
+            }
         }
         Ok(())
     }
@@ -218,6 +357,7 @@ impl SegmentCompositeCollector {
         let sub_agg = sub_agg.map(BufferedSubAggs::new);
 
         let num_sources = composite_req_data.req.sources.len();
+        let fast_path = select_composite_fast_path(&composite_req_data, sub_agg.is_some());
 
         Ok(SegmentCompositeCollector {
             parent_buckets: vec![DynArrayHeapMap::try_new(num_sources)?],
@@ -225,6 +365,7 @@ impl SegmentCompositeCollector {
             sub_agg,
             bucket_id_provider: BucketIdProvider::default(),
             num_sources,
+            fast_path,
         })
     }
 
@@ -234,6 +375,75 @@ impl SegmentCompositeCollector {
         agg_data: &AggregationsSegmentCtx,
         parent_bucket_id: BucketId,
     ) -> crate::Result<IntermediateCompositeBucketResult> {
+        let composite_data = &self.req_data;
+        if let CompositeFastPath::SingleDateHistogramFixed {
+            interval_ns,
+            order,
+            dense: Some(dense_buckets),
+            ..
+        } = &mut self.fast_path
+        {
+            let limit = composite_data.req.size as usize;
+            let base = dense_buckets.base_bucket_idx;
+            let interval_ns = *interval_ns;
+            let order = *order;
+            let counts = mem::take(&mut dense_buckets.parent_counts[parent_bucket_id as usize]);
+            let mut dict: FxHashMap<
+                Vec<CompositeIntermediateKey>,
+                IntermediateCompositeBucketEntry,
+            > = Default::default();
+            dict.reserve(limit.min(counts.len()));
+            let emit = |slot: usize,
+                        count: u32,
+                        dict: &mut FxHashMap<
+                Vec<CompositeIntermediateKey>,
+                IntermediateCompositeBucketEntry,
+            >| {
+                if count > 0 {
+                    let bucket_ts = (base + slot as i64) * interval_ns;
+                    dict.insert(
+                        vec![CompositeIntermediateKey::DateTime(bucket_ts)],
+                        IntermediateCompositeBucketEntry {
+                            doc_count: count as u64,
+                            sub_aggregation: IntermediateAggregationResults::default(),
+                        },
+                    );
+                }
+            };
+            match order {
+                Order::Asc => {
+                    for (slot, &count) in counts.iter().enumerate() {
+                        emit(slot, count, &mut dict);
+                        if dict.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                Order::Desc => {
+                    for (slot, &count) in counts.iter().enumerate().rev() {
+                        emit(slot, count, &mut dict);
+                        if dict.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            return Ok(IntermediateCompositeBucketResult {
+                entries: dict,
+                target_size: composite_data.req.size,
+                orders: composite_data
+                    .req
+                    .sources
+                    .iter()
+                    .map(|source| match source {
+                        CompositeAggregationSource::Terms(t) => (t.order, t.missing_order),
+                        CompositeAggregationSource::Histogram(h) => (h.order, h.missing_order),
+                        CompositeAggregationSource::DateHistogram(d) => (d.order, d.missing_order),
+                    })
+                    .collect(),
+            });
+        }
+
         let empty_map = DynArrayHeapMap::try_new(self.num_sources)?;
         let heap_map = mem::replace(
             &mut self.parent_buckets[parent_bucket_id as usize],
@@ -243,7 +453,6 @@ impl SegmentCompositeCollector {
         let mut dict: FxHashMap<Vec<CompositeIntermediateKey>, IntermediateCompositeBucketEntry> =
             Default::default();
         dict.reserve(heap_map.size());
-        let composite_data = &self.req_data;
         for (key_internal_repr, agg) in heap_map.into_iter() {
             let key = resolve_key(&key_internal_repr, composite_data)?;
             let mut sub_aggregation_res = IntermediateAggregationResults::default();
@@ -280,6 +489,246 @@ impl SegmentCompositeCollector {
                 })
                 .collect(),
         })
+    }
+}
+
+#[inline(always)]
+fn compute_fixed_date_bucket_idx(raw_val: u64, interval_ns: i64, divider: DividerU64) -> i64 {
+    let val_ns = i64::from_u64(raw_val);
+    if val_ns >= 0 {
+        divider.divide(val_ns as u64) as i64
+    } else {
+        val_ns / interval_ns
+    }
+}
+
+#[inline(always)]
+fn compute_fixed_date_bucket(
+    raw_val: u64,
+    interval_ns: i64,
+    interval_u64: u64,
+    divider: DividerU64,
+) -> u64 {
+    let val_ns = i64::from_u64(raw_val);
+    let bucket_ns = if val_ns >= 0 {
+        (divider.divide(val_ns as u64).wrapping_mul(interval_u64)) as i64
+    } else {
+        (val_ns / interval_ns) * interval_ns
+    };
+    i64::to_u64(bucket_ns)
+}
+
+#[inline(always)]
+fn add_count_to_bucket(
+    limit_num_buckets: usize,
+    buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
+    key: &[InternalValueRepr],
+    count: u32,
+) {
+    if buckets.size() < limit_num_buckets {
+        let bucket = buckets.get_or_insert_with(key, || CompositeBucketCollector {
+            count: 0,
+            bucket_id: 0,
+        });
+        bucket.count += count;
+        return;
+    }
+
+    if let Some(bucket) = buckets.get_mut(key) {
+        bucket.count += count;
+        return;
+    }
+
+    if let Some(highest_key) = buckets.peek_highest() {
+        if key < highest_key {
+            buckets.evict_highest();
+            let bucket = buckets.get_or_insert_with(key, || CompositeBucketCollector {
+                count: 0,
+                bucket_id: 0,
+            });
+            bucket.count += count;
+        }
+    }
+}
+
+fn select_composite_fast_path(
+    req_data: &CompositeAggReqData,
+    has_sub_agg: bool,
+) -> CompositeFastPath {
+    if has_sub_agg || !req_data.req.after.is_empty() {
+        return CompositeFastPath::General;
+    }
+    let sources = &req_data.req.sources;
+    if sources.len() == 1 {
+        if let CompositeAggregationSource::DateHistogram(date_src) = &sources[0] {
+            let level = &req_data.composite_accessors[0];
+            if !date_src.missing_bucket && level.accessors.len() == 1 {
+                let acc = &level.accessors[0];
+                let card = acc.column.index.get_cardinality();
+                if acc.column_type == ColumnType::DateTime && !card.is_multivalue() {
+                    if let PrecomputedDateInterval::FixedNanoseconds(interval_ns) =
+                        acc.date_histogram_interval
+                    {
+                        if interval_ns > 0 {
+                            let divider = DividerU64::divide_by(interval_ns as u64);
+                            let dense = if acc.column.values.num_vals() > 0 {
+                                let min_idx = compute_fixed_date_bucket_idx(
+                                    acc.column.min_value(),
+                                    interval_ns,
+                                    divider,
+                                );
+                                let max_idx = compute_fixed_date_bucket_idx(
+                                    acc.column.max_value(),
+                                    interval_ns,
+                                    divider,
+                                );
+                                const MAX_DENSE_DATE_BUCKETS: i64 = 4096;
+                                if max_idx >= min_idx
+                                    && (max_idx - min_idx) < MAX_DENSE_DATE_BUCKETS
+                                {
+                                    let span = (max_idx - min_idx + 1) as usize;
+                                    Some(DenseDateBuckets {
+                                        base_bucket_idx: min_idx,
+                                        span,
+                                        parent_counts: vec![vec![0u32; span]],
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            return CompositeFastPath::SingleDateHistogramFixed {
+                                column: acc.column.clone(),
+                                is_full: card == Cardinality::Full,
+                                interval_ns,
+                                divider,
+                                order: date_src.order,
+                                dense,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !sources.is_empty() && sources.len() <= 4 {
+        let mut columns = SmallVec::<[Column<u64>; 4]>::new();
+        let mut orders = SmallVec::<[Order; 4]>::new();
+        let mut eligible = true;
+        for (source, level) in sources.iter().zip(&req_data.composite_accessors) {
+            let CompositeAggregationSource::Terms(terms_src) = source else {
+                eligible = false;
+                break;
+            };
+            if terms_src.missing_bucket || level.accessors.len() != 1 {
+                eligible = false;
+                break;
+            }
+            let acc = &level.accessors[0];
+            if acc.column.index.get_cardinality() != Cardinality::Full {
+                eligible = false;
+                break;
+            }
+            columns.push(acc.column.clone());
+            orders.push(terms_src.order);
+        }
+        if eligible {
+            return CompositeFastPath::MultiTermsFull { columns, orders };
+        }
+    }
+
+    CompositeFastPath::General
+}
+
+#[inline(always)]
+fn encode_term_value(raw: u64, order: Order) -> InternalValueRepr {
+    InternalValueRepr::new_term(raw, 0, order)
+}
+
+fn collect_multi_terms_full_fast(
+    docs: &[crate::DocId],
+    columns: &[Column<u64>],
+    orders: &[Order],
+    limit: usize,
+    buckets: &mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
+) {
+    let num_sources = columns.len();
+    debug_assert!((1..=4).contains(&num_sources));
+
+    let mut vals_buf = [0u64; 64];
+    let mut surv_docs = [0u32; 64];
+    let mut surv_keys = [[InternalValueRepr::default(); 4]; 64];
+
+    for chunk in docs.chunks(64) {
+        let chunk_len = chunk.len();
+        columns[0]
+            .values
+            .get_vals(chunk, &mut vals_buf[..chunk_len]);
+        let order0 = orders[0];
+
+        let mut surv_len = 0usize;
+        if buckets.size() >= limit {
+            let max_key_0 = buckets.peek_highest().unwrap()[0];
+            for i in 0..chunk_len {
+                let encoded0 = encode_term_value(vals_buf[i], order0);
+                if encoded0 <= max_key_0 {
+                    surv_docs[surv_len] = chunk[i];
+                    surv_keys[surv_len][0] = encoded0;
+                    surv_len += 1;
+                }
+            }
+            if surv_len == 0 {
+                continue;
+            }
+
+            // Read subsequent columns only for surviving docs, pruning at each prefix level.
+            let mut max_key = [InternalValueRepr::default(); 4];
+            if let Some(highest) = buckets.peek_highest() {
+                max_key[..num_sources].copy_from_slice(highest);
+            }
+            for src_idx in 1..num_sources {
+                columns[src_idx]
+                    .values
+                    .get_vals(&surv_docs[..surv_len], &mut vals_buf[..surv_len]);
+                let order = orders[src_idx];
+                let mut next_surv = 0usize;
+                for i in 0..surv_len {
+                    surv_keys[i][src_idx] = encode_term_value(vals_buf[i], order);
+                    if surv_keys[i][..=src_idx] <= max_key[..=src_idx] {
+                        if next_surv != i {
+                            surv_docs[next_surv] = surv_docs[i];
+                            surv_keys[next_surv] = surv_keys[i];
+                        }
+                        next_surv += 1;
+                    }
+                }
+                surv_len = next_surv;
+                if surv_len == 0 {
+                    break;
+                }
+            }
+            for key_arr in &surv_keys[..surv_len] {
+                add_count_to_bucket(limit, buckets, &key_arr[..num_sources], 1);
+            }
+        } else {
+            for i in 0..chunk_len {
+                surv_keys[i][0] = encode_term_value(vals_buf[i], order0);
+            }
+            for src_idx in 1..num_sources {
+                columns[src_idx]
+                    .values
+                    .get_vals(chunk, &mut vals_buf[..chunk_len]);
+                let order = orders[src_idx];
+                for i in 0..chunk_len {
+                    surv_keys[i][src_idx] = encode_term_value(vals_buf[i], order);
+                }
+            }
+            for key_arr in &surv_keys[..chunk_len] {
+                add_count_to_bucket(limit, buckets, &key_arr[..num_sources], 1);
+            }
+        }
     }
 }
 

@@ -158,6 +158,9 @@ pub struct SegmentRangeCollector<B: SubAggBuffer, const SOURCE_CONTAINS_MULTIVAL
     /// The buckets containing the aggregation data.
     /// One for each ParentBucketId
     parent_buckets: Vec<Vec<SegmentRangeAndBucketEntry>>,
+    /// Compact sorted upper bounds of buckets `0..num_buckets - 1` (identical across all parent
+    /// buckets) for branchless cache-friendly bucket lookup.
+    range_ends: Vec<u64>,
     pub(crate) req_data: RangeAggReqData,
     sub_agg: Option<BufferedSubAggs<B>>,
     /// Here things get a bit weird. We need to assign unique bucket ids across all
@@ -288,12 +291,67 @@ impl<B: SubAggBuffer, const SOURCE_CONTAINS_MULTIVALUES: bool> SegmentAggregatio
         );
 
         let buckets = &mut self.parent_buckets[parent_bucket_id as usize];
+        let range_ends = &self.range_ends;
 
         // Known single-valued sources compile out deduplication; otherwise check the loaded batch.
         let multivalued = SOURCE_CONTAINS_MULTIVALUES && accessor.is_batch_multivalued();
+        if !multivalued && range_ends.len() <= 16 {
+            let mut local_counts = [0u64; 17];
+            if let Some(sub_agg) = self.sub_agg.as_mut() {
+                let mut bucket_ids = [0u32; 17];
+                let mut max_bucket_id = 0u32;
+                for (slot, bucket) in bucket_ids.iter_mut().zip(buckets.iter()) {
+                    let bid = bucket.bucket.bucket_id;
+                    *slot = bid;
+                    max_bucket_id = max_bucket_id.max(bid);
+                }
+                sub_agg.ensure_buckets(max_bucket_id);
+                let mut pushed_docs = 0usize;
+                if accessor.cardinality().is_full() {
+                    for (&doc, &val) in docs.iter().zip(accessor.values()) {
+                        let mut bucket_pos = 0usize;
+                        for &end in range_ends {
+                            bucket_pos += usize::from(val >= end);
+                        }
+                        local_counts[bucket_pos] += 1;
+                        sub_agg.push_preallocated(bucket_ids[bucket_pos], doc);
+                    }
+                    pushed_docs = docs.len();
+                } else {
+                    for (doc, val) in accessor.iter_docid_vals(docs) {
+                        let mut bucket_pos = 0usize;
+                        for &end in range_ends {
+                            bucket_pos += usize::from(val >= end);
+                        }
+                        local_counts[bucket_pos] += 1;
+                        sub_agg.push_preallocated(bucket_ids[bucket_pos], doc);
+                        pushed_docs += 1;
+                    }
+                }
+                sub_agg.add_buffered_docs(pushed_docs);
+                for (bucket, &count) in buckets.iter_mut().zip(&local_counts) {
+                    bucket.bucket.doc_count += count;
+                }
+                sub_agg.check_flush_local(agg_data)?;
+                return Ok(());
+            }
+
+            for val in accessor.iter_vals() {
+                let mut bucket_pos = 0usize;
+                for &end in range_ends {
+                    bucket_pos += usize::from(val >= end);
+                }
+                local_counts[bucket_pos] += 1;
+            }
+            for (bucket, &count) in buckets.iter_mut().zip(&local_counts) {
+                bucket.bucket.doc_count += count;
+            }
+            return Ok(());
+        }
+
         let mut previous = None;
         for (doc, val) in accessor.iter_docid_vals(docs) {
-            let bucket_pos = get_bucket_pos(val, buckets);
+            let bucket_pos = get_bucket_pos_fast(val, range_ends, buckets);
             if multivalued {
                 // The fetcher makes equal range hits consecutive within each document.
                 if previous == Some((doc, bucket_pos)) {
@@ -385,6 +443,7 @@ fn build_range_collector_with_cardinality<const SOURCE_CONTAINS_MULTIVALUES: boo
             sub_agg: sub_agg.map(LowCardBufferedSubAggs::new),
             req_data,
             parent_buckets: Vec::new(),
+            range_ends: Vec::new(),
             bucket_id_provider: BucketIdProvider::default(),
             limits: agg_data.context.limits.clone(),
         }))
@@ -396,6 +455,7 @@ fn build_range_collector_with_cardinality<const SOURCE_CONTAINS_MULTIVALUES: boo
             sub_agg: sub_agg.map(BufferedSubAggs::new),
             req_data,
             parent_buckets: Vec::new(),
+            range_ends: Vec::new(),
             bucket_id_provider: BucketIdProvider::default(),
             limits: agg_data.context.limits.clone(),
         }))
@@ -448,9 +508,34 @@ impl<B: SubAggBuffer, const SOURCE_CONTAINS_MULTIVALUES: bool>
         self.limits.add_memory_consumed(
             buckets.len() as u64 * std::mem::size_of::<SegmentRangeAndBucketEntry>() as u64,
         )?;
+        if self.range_ends.is_empty() && buckets.len() > 1 {
+            self.range_ends = buckets[..buckets.len() - 1]
+                .iter()
+                .map(|entry| entry.range.end)
+                .collect();
+        }
         Ok(buckets)
     }
 }
+
+#[inline(always)]
+fn get_bucket_pos_fast(
+    val: u64,
+    range_ends: &[u64],
+    buckets: &[SegmentRangeAndBucketEntry],
+) -> usize {
+    if range_ends.len() <= 16 {
+        let mut pos = 0usize;
+        for &end in range_ends {
+            pos += usize::from(val >= end);
+        }
+        debug_assert!(buckets[pos].range.contains(&val));
+        pos
+    } else {
+        get_bucket_pos(val, buckets)
+    }
+}
+
 #[inline]
 fn get_bucket_pos(val: u64, buckets: &[SegmentRangeAndBucketEntry]) -> usize {
     let pos = buckets

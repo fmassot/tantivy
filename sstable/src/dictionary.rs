@@ -715,6 +715,39 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(true)
     }
 
+    /// Streams every term in the dictionary in lexicographical order, invoking `cb` for each term.
+    ///
+    /// Decodes each block directly from its local byte slice without ordinal bookkeeping or
+    /// per-term reader reloads.
+    pub fn stream_all_terms_cb(&self, mut cb: impl FnMut(&[u8])) -> io::Result<()> {
+        if self.num_terms == 0 {
+            return Ok(());
+        }
+        let mut delta_reader =
+            DeltaReader::<TSSTable::ValueReader>::new(self.sstable_slice.read_bytes()?);
+        let mut bytes = Vec::with_capacity(256);
+        while let Some(mut block) = delta_reader.next_block_lazy()? {
+            while !block.is_empty() {
+                let header = block[0];
+                block = &block[1..];
+                let (keep, add) = if header == 1u8 {
+                    let (c1, keep) = crate::vint::deserialize_read(block);
+                    block = &block[c1..];
+                    let (c2, add) = crate::vint::deserialize_read(block);
+                    block = &block[c2..];
+                    (keep as usize, add as usize)
+                } else {
+                    ((header & 0b1111) as usize, (header >> 4) as usize)
+                };
+                bytes.truncate(keep);
+                bytes.extend_from_slice(&block[..add]);
+                block = &block[add..];
+                cb(&bytes);
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the terms for a _sorted_ list of term ordinals.
     ///
     /// Returns true if and only if all terms have been found.
@@ -735,6 +768,22 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             let mut delta_reader =
                 DeltaReader::<TSSTable::ValueReader>::new(self.sstable_slice.read_bytes()?);
             let mut bytes = Vec::with_capacity(256);
+
+            // All-terms fast path (ords == 0..num_terms): decode each block directly from a
+            // local byte slice without per-term DeltaReader state reloads or ordinal checks.
+            let is_all_terms = ords.len() as u64 == self.num_terms
+                && ords.first() == Some(&0)
+                && ords.last() == Some(&(self.num_terms - 1))
+                && ords.iter().enumerate().all(|(idx, &ord)| ord == idx as u64);
+            if is_all_terms {
+                let mut emitted: u64 = 0;
+                self.stream_all_terms_cb(|term| {
+                    cb(term);
+                    emitted += 1;
+                })?;
+                return Ok(emitted == self.num_terms);
+            }
+
             let mut current_ord: u64 = 0;
             for &target_ord in ords {
                 if target_ord >= self.num_terms {
@@ -1506,6 +1555,27 @@ mod tests {
                 assert_eq!(chunked, expected, "chunked mismatch for pattern {pattern}");
             }
         }
+    }
+
+    #[test]
+    fn test_stream_all_terms_cb() {
+        let mut terms: Vec<String> = (0..500)
+            .map(|idx| format!("term-{idx:04}-payload-with-shared-prefix"))
+            .collect();
+        terms.sort();
+        let mut builder = Dictionary::<crate::VoidSSTable>::builder(Vec::new()).unwrap();
+        for term in &terms {
+            builder.insert(term.as_bytes(), &()).unwrap();
+        }
+        let bytes = builder.finish().unwrap();
+        let dict = Dictionary::<crate::VoidSSTable>::from_bytes(OwnedBytes::new(bytes)).unwrap();
+
+        let mut streamed = Vec::new();
+        dict.stream_all_terms_cb(|term_bytes| {
+            streamed.push(String::from_utf8(term_bytes.to_vec()).unwrap());
+        })
+        .unwrap();
+        assert_eq!(streamed, terms);
     }
 }
 

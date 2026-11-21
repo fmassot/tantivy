@@ -197,10 +197,17 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
         docs: &[crate::DocId],
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        for collector in &mut self.aggs {
-            collector.collect(parent_bucket_id, docs, agg_data)?;
-        }
-        Ok(())
+        let prev_epoch = agg_data.column_block_accessor.enter_shared_docs_scope(docs);
+        let res = (|| {
+            for collector in &mut self.aggs {
+                collector.collect(parent_bucket_id, docs, agg_data)?;
+            }
+            Ok(())
+        })();
+        agg_data
+            .column_block_accessor
+            .exit_shared_docs_scope(prev_epoch);
+        res
     }
 
     fn collect_multiple(
@@ -209,10 +216,17 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
         docs: &[crate::DocId],
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        for collector in &mut self.aggs {
-            collector.collect_multiple(bucket_ids, docs, agg_data)?;
-        }
-        Ok(())
+        let prev_epoch = agg_data.column_block_accessor.enter_shared_docs_scope(docs);
+        let res = (|| {
+            for collector in &mut self.aggs {
+                collector.collect_multiple(bucket_ids, docs, agg_data)?;
+            }
+            Ok(())
+        })();
+        agg_data
+            .column_block_accessor
+            .exit_shared_docs_scope(prev_epoch);
+        res
     }
 
     fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
