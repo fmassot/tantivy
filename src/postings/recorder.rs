@@ -1,4 +1,4 @@
-use common::read_u32_vint;
+use common::{read_u32_vint, serialize_vint_u32};
 use stacker::{ExpUnrolledLinkedList, MemoryArena};
 
 use crate::indexer::doc_id_mapping::DocIdMapping;
@@ -6,6 +6,19 @@ use crate::postings::FieldSerializer;
 use crate::DocId;
 
 const POSITION_END: u32 = 0;
+
+#[inline(always)]
+fn push_u32_vint(buf: &mut [u8], pos: &mut usize, val: u32) {
+    if val < 128 {
+        buf[*pos] = (val as u8) | 0x80;
+        *pos += 1;
+    } else {
+        let mut tmp = [0u8; 8];
+        let encoded = serialize_vint_u32(val, &mut tmp);
+        buf[*pos..*pos + encoded.len()].copy_from_slice(encoded);
+        *pos += encoded.len();
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct BufferLender {
@@ -70,6 +83,26 @@ pub(crate) trait Recorder: Copy + Default + Send + Sync + 'static {
     fn record_position(&mut self, position: u32, arena: &mut MemoryArena);
     /// Close the document. It will help record the term frequency.
     fn close_doc(&mut self, arena: &mut MemoryArena);
+    /// Closes the previous document, opens `doc`, and records `position` in a single fused call.
+    #[inline]
+    fn close_and_new_doc_with_position(
+        &mut self,
+        doc: DocId,
+        position: u32,
+        arena: &mut MemoryArena,
+    ) {
+        self.close_doc(arena);
+        self.new_doc(doc, arena);
+        self.record_position(position, arena);
+    }
+    /// Initializes a brand-new recorder for `doc` at `position` in a single fused call.
+    #[inline]
+    fn init_with_doc_and_position(doc: DocId, position: u32, arena: &mut MemoryArena) -> Self {
+        let mut recorder = Self::default();
+        recorder.new_doc(doc, arena);
+        recorder.record_position(position, arena);
+        recorder
+    }
     /// Pushes the postings information to the serializer.
     fn serialize(
         &self,
@@ -194,6 +227,25 @@ impl Recorder for TermFrequencyRecorder {
         self.current_tf = 0;
     }
 
+    #[inline]
+    fn close_and_new_doc_with_position(
+        &mut self,
+        doc: DocId,
+        _position: u32,
+        arena: &mut MemoryArena,
+    ) {
+        debug_assert!(self.current_tf > 0);
+        let delta = doc - self.current_doc;
+        let mut buf = [0u8; 10];
+        let mut len = 0;
+        push_u32_vint(&mut buf, &mut len, self.current_tf);
+        push_u32_vint(&mut buf, &mut len, delta);
+        self.current_doc = doc;
+        self.term_doc_freq += 1;
+        self.current_tf = 1;
+        self.stack.writer(arena).extend_from_slice(&buf[..len]);
+    }
+
     fn serialize(
         &self,
         arena: &MemoryArena,
@@ -272,6 +324,40 @@ impl Recorder for TfAndPositionRecorder {
     #[inline]
     fn close_doc(&mut self, arena: &mut MemoryArena) {
         self.stack.writer(arena).write_u32_vint(POSITION_END);
+    }
+
+    #[inline]
+    fn close_and_new_doc_with_position(
+        &mut self,
+        doc: DocId,
+        position: u32,
+        arena: &mut MemoryArena,
+    ) {
+        let delta = doc - self.current_doc;
+        self.current_doc = doc;
+        self.term_doc_freq += 1u32;
+        let mut buf = [0u8; 11];
+        // VInt(POSITION_END == 0) is always 0x80.
+        buf[0] = 0x80;
+        let mut len = 1;
+        push_u32_vint(&mut buf, &mut len, delta);
+        push_u32_vint(&mut buf, &mut len, position.wrapping_add(1u32));
+        self.stack.writer(arena).extend_from_slice(&buf[..len]);
+    }
+
+    #[inline]
+    fn init_with_doc_and_position(doc: DocId, position: u32, arena: &mut MemoryArena) -> Self {
+        let mut recorder = Self {
+            stack: ExpUnrolledLinkedList::default(),
+            current_doc: doc,
+            term_doc_freq: 1u32,
+        };
+        let mut buf = [0u8; 10];
+        let mut len = 0;
+        push_u32_vint(&mut buf, &mut len, doc);
+        push_u32_vint(&mut buf, &mut len, position.wrapping_add(1u32));
+        recorder.stack.writer(arena).extend_from_slice(&buf[..len]);
+        recorder
     }
 
     fn serialize(

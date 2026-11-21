@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use columnar::MonotonicallyMappableToU64;
 use common::JsonPathWriter;
-use itertools::Itertools;
 use measure_time::debug_time;
 use tokenizer_api::BoxTokenStream;
 
@@ -201,13 +200,38 @@ impl InvertedIndexPluginWriter {
         doc_id: DocId,
         doc: &D,
     ) -> crate::Result<()> {
-        let vals_grouped_by_field = doc
-            .iter_fields_and_values()
-            .sorted_by_key(|(field, _)| *field)
-            .chunk_by(|(field, _)| *field);
+        // Filter out non-indexed fields first and avoid heap allocations in the common case.
+        let mut indexed_vals: smallvec::SmallVec<[(Field, D::Value<'_>); 16]> =
+            smallvec::SmallVec::new();
+        let mut is_sorted = true;
+        let mut prev_field: Option<Field> = None;
+        for (field, value) in doc.iter_fields_and_values() {
+            if !self.schema.get_field_entry(field).is_indexed() {
+                continue;
+            }
+            if let Some(prev) = prev_field {
+                if field < prev {
+                    is_sorted = false;
+                }
+            }
+            prev_field = Some(field);
+            indexed_vals.push((field, value));
+        }
+        if !is_sorted {
+            indexed_vals.sort_by_key(|(field, _)| *field);
+        }
 
-        for (field, field_values) in &vals_grouped_by_field {
-            let values = field_values.map(|el| el.1);
+        let mut group_start = 0;
+        while group_start < indexed_vals.len() {
+            let field = indexed_vals[group_start].0;
+            let mut group_end = group_start + 1;
+            while group_end < indexed_vals.len() && indexed_vals[group_end].0 == field {
+                group_end += 1;
+            }
+            let values = indexed_vals[group_start..group_end]
+                .iter()
+                .map(|(_, val)| val.clone());
+            group_start = group_end;
 
             let field_entry = self.schema.get_field_entry(field);
             let make_schema_error = || {
@@ -217,9 +241,6 @@ impl InvertedIndexPluginWriter {
                     field_entry.name()
                 ))
             };
-            if !field_entry.is_indexed() {
-                continue;
-            }
 
             let (term_buffer, ctx) = (&mut self.term_buffer, &mut self.ctx);
             let postings_writer: &mut dyn PostingsWriter =

@@ -216,18 +216,14 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
         let (term_index, arena) = (&mut ctx.term_index, &mut ctx.arena);
         term_index.mutate_or_create(term.serialized_term(), |opt_recorder: Option<Rec>| {
             if let Some(mut recorder) = opt_recorder {
-                let current_doc = recorder.current_doc();
-                if current_doc != doc {
-                    recorder.close_doc(arena);
-                    recorder.new_doc(doc, arena);
+                if recorder.current_doc() != doc {
+                    recorder.close_and_new_doc_with_position(doc, position, arena);
+                } else {
+                    recorder.record_position(position, arena);
                 }
-                recorder.record_position(position, arena);
                 recorder
             } else {
-                let mut recorder = Rec::default();
-                recorder.new_doc(doc, arena);
-                recorder.record_position(position, arena);
-                recorder
+                Rec::init_with_doc_and_position(doc, position, arena)
             }
         });
     }

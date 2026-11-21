@@ -23,8 +23,10 @@ enum BlockCompressorVariants {
 
 impl BlockCompressor {
     pub fn new(compressor: Compressor, wrt: WritePtr, dedicated_thread: bool) -> io::Result<Self> {
-        let block_compressor_impl = BlockCompressorImpl::new(compressor, wrt);
-        if dedicated_thread {
+        let block_compressor_impl = BlockCompressorImpl::new(compressor, wrt)?;
+        // No compression work to offload for `Compressor::None`: avoid spawning a thread and
+        // copying every block to a fresh `Vec<u8>`.
+        if dedicated_thread && !matches!(compressor, Compressor::None) {
             let dedicated_thread_compressor =
                 DedicatedThreadBlockCompressorImpl::new(block_compressor_impl)?;
             Ok(BlockCompressor(BlockCompressorVariants::DedicatedThread(
@@ -79,6 +81,8 @@ impl BlockCompressor {
 
 struct BlockCompressorImpl {
     compressor: Compressor,
+    #[cfg(feature = "zstd-compression")]
+    zstd_compressor: Option<zstd::bulk::Compressor<'static>>,
     first_doc_in_block: DocId,
     offset_index_writer: SkipIndexBuilder,
     intermediary_buffer: Vec<u8>,
@@ -86,24 +90,50 @@ struct BlockCompressorImpl {
 }
 
 impl BlockCompressorImpl {
-    fn new(compressor: Compressor, writer: WritePtr) -> Self {
-        Self {
+    fn new(compressor: Compressor, writer: WritePtr) -> io::Result<Self> {
+        #[cfg(feature = "zstd-compression")]
+        let zstd_compressor = match compressor {
+            Compressor::Zstd(zstd_cfg) => Some(super::compression_zstd_block::new_zstd_compressor(
+                zstd_cfg.compression_level,
+            )?),
+            _ => None,
+        };
+        Ok(Self {
             compressor,
+            #[cfg(feature = "zstd-compression")]
+            zstd_compressor,
             first_doc_in_block: 0,
             offset_index_writer: SkipIndexBuilder::new(),
             intermediary_buffer: Vec::new(),
             writer: CountingWriter::wrap(writer),
-        }
+        })
     }
 
     fn compress_block_and_write(&mut self, data: &[u8], num_docs_in_block: u32) -> io::Result<()> {
         assert!(num_docs_in_block > 0);
-        self.intermediary_buffer.clear();
-        self.compressor
-            .compress_into(data, &mut self.intermediary_buffer)?;
+        let written_slice: &[u8] = if matches!(self.compressor, Compressor::None) {
+            data
+        } else {
+            self.intermediary_buffer.clear();
+            #[cfg(feature = "zstd-compression")]
+            if let Some(zstd_compressor) = self.zstd_compressor.as_mut() {
+                super::compression_zstd_block::compress_with_compressor(
+                    zstd_compressor,
+                    data,
+                    &mut self.intermediary_buffer,
+                )?;
+            } else {
+                self.compressor
+                    .compress_into(data, &mut self.intermediary_buffer)?;
+            }
+            #[cfg(not(feature = "zstd-compression"))]
+            self.compressor
+                .compress_into(data, &mut self.intermediary_buffer)?;
+            &self.intermediary_buffer
+        };
 
         let start_offset = self.writer.written_bytes() as usize;
-        self.writer.write_all(&self.intermediary_buffer)?;
+        self.writer.write_all(written_slice)?;
         let end_offset = self.writer.written_bytes() as usize;
 
         self.register_checkpoint(Checkpoint {

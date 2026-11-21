@@ -5,17 +5,19 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::io::Write;
 
+use common::TerminatingWrite;
 use measure_time::debug_time;
 
-use crate::directory::Directory;
+use crate::directory::{Directory, WritePtr};
 use crate::index::{SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
-use crate::schema::document::Document;
+use crate::schema::document::{serialize_doc_to_vec, Document};
 use crate::schema::Schema;
 use crate::space_usage::{ComponentSpaceUsage, STORE};
-use crate::store::{StoreReader, StoreWriter};
+use crate::store::StoreWriter;
 use crate::Segment;
 
 /// Built-in segment plugin that stores and merges stored documents.
@@ -108,10 +110,61 @@ impl SegmentPlugin for StorePlugin {
     }
 }
 
+/// Flat sequential writer for the ephemeral `SegmentComponent::TempStore` file used when
+/// documents must be reordered by a [`DocIdMapping`] before writing the final compressed store.
+///
+/// Storing raw serialized document bytes back-to-back with an in-memory `doc_offsets` index
+/// avoids block framing, skip-index construction/lookup, and LRU block-cache locking during
+/// random-order resorting.
+struct TempStoreWriter {
+    writer: WritePtr,
+    doc_buf: Vec<u8>,
+    /// Byte offsets into `TempStore`: document `i` occupies `doc_offsets[i]..doc_offsets[i + 1]`.
+    doc_offsets: Vec<u64>,
+    bytes_written: u64,
+}
+
+impl TempStoreWriter {
+    fn new(writer: WritePtr) -> Self {
+        let mut doc_offsets = Vec::with_capacity(1024);
+        doc_offsets.push(0);
+        Self {
+            writer,
+            doc_buf: Vec::with_capacity(2048),
+            doc_offsets,
+            bytes_written: 0,
+        }
+    }
+
+    fn store<D: Document>(&mut self, document: &D, schema: &Schema) -> std::io::Result<()> {
+        self.doc_buf.clear();
+        serialize_doc_to_vec(document, schema, &mut self.doc_buf)?;
+        self.writer.write_all(&self.doc_buf)?;
+        self.bytes_written += self.doc_buf.len() as u64;
+        self.doc_offsets.push(self.bytes_written);
+        Ok(())
+    }
+
+    fn store_bytes(&mut self, serialized_document: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(serialized_document)?;
+        self.bytes_written += serialized_document.len() as u64;
+        self.doc_offsets.push(self.bytes_written);
+        Ok(())
+    }
+
+    fn mem_usage(&self) -> usize {
+        self.doc_buf.capacity() + self.doc_offsets.capacity() * std::mem::size_of::<u64>()
+    }
+}
+
+enum ActiveStoreWriter {
+    Direct(StoreWriter),
+    Temp(TempStoreWriter),
+}
+
 /// Accumulates and serializes stored documents for a segment.
 pub struct StorePluginWriter {
-    store_writer: Option<StoreWriter>,
-    remapping_required: bool,
+    store_writer: Option<ActiveStoreWriter>,
 }
 
 impl StorePluginWriter {
@@ -120,51 +173,50 @@ impl StorePluginWriter {
         let directory = ctx.segment.index().directory();
         let remapping_required = settings.sort_by_field.is_some() || settings.manual_doc_id_mapping;
 
-        let store_writer = if remapping_required {
+        let active_writer = if remapping_required {
             let path = ctx.segment.relative_path(SegmentComponent::TempStore);
             let store_write = directory.open_write(&path)?;
-            StoreWriter::new(
-                store_write,
-                crate::store::Compressor::None,
-                // We want fast random access on the docs, so we choose a small block size.
-                // If this is zero, the skip index will contain too many checkpoints and
-                // therefore will be relatively slow.
-                16000,
-                settings.docstore_compress_dedicated_thread,
-            )?
+            ActiveStoreWriter::Temp(TempStoreWriter::new(store_write))
         } else {
             let path = ctx.segment.relative_path(SegmentComponent::Store);
             let store_write = directory.open_write(&path)?;
-            StoreWriter::new(
+            ActiveStoreWriter::Direct(StoreWriter::new(
                 store_write,
                 settings.docstore_compression,
                 settings.docstore_blocksize,
                 settings.docstore_compress_dedicated_thread,
-            )?
+            )?)
         };
 
         Ok(StorePluginWriter {
-            store_writer: Some(store_writer),
-            remapping_required,
+            store_writer: Some(active_writer),
         })
     }
 
     /// Serializes and stores a document according to the supplied schema.
     pub fn store<D: Document>(&mut self, document: &D, schema: &Schema) -> crate::Result<()> {
-        if let Some(ref mut writer) = self.store_writer {
-            writer
+        match self.store_writer.as_mut() {
+            Some(ActiveStoreWriter::Direct(writer)) => writer
                 .store(document, schema)
-                .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
+                .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?,
+            Some(ActiveStoreWriter::Temp(writer)) => writer
+                .store(document, schema)
+                .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?,
+            None => {}
         }
         Ok(())
     }
 
     /// Stores an already serialized document.
     pub fn store_bytes(&mut self, serialized_document: &[u8]) -> crate::Result<()> {
-        if let Some(ref mut writer) = self.store_writer {
-            writer
+        match self.store_writer.as_mut() {
+            Some(ActiveStoreWriter::Direct(writer)) => writer
                 .store_bytes(serialized_document)
-                .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
+                .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?,
+            Some(ActiveStoreWriter::Temp(writer)) => writer
+                .store_bytes(serialized_document)
+                .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?,
+            None => {}
         }
         Ok(())
     }
@@ -176,60 +228,61 @@ impl PluginWriter for StorePluginWriter {
         segment: &Segment,
         doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
-        // For sorted indexes (remapping_required), we need to close the temp store
-        // and reorder documents into the final store.
-        if self.remapping_required {
-            if let Some(doc_id_map) = doc_id_map {
-                debug!("resort-docstore");
-                // Close the temp store writer first
-                if let Some(old_writer) = self.store_writer.take() {
-                    old_writer
+        match self.store_writer.take() {
+            Some(ActiveStoreWriter::Temp(temp_writer)) => {
+                temp_writer
+                    .writer
+                    .terminate()
+                    .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
+
+                if let Some(doc_id_map) = doc_id_map {
+                    debug!("resort-docstore");
+                    let settings = segment.index().settings().clone();
+                    let store_write = segment.open_write(SegmentComponent::Store)?;
+                    let mut store_writer = StoreWriter::new(
+                        store_write,
+                        settings.docstore_compression,
+                        settings.docstore_blocksize,
+                        settings.docstore_compress_dedicated_thread,
+                    )
+                    .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
+
+                    let temp_file = segment.open_read(SegmentComponent::TempStore)?;
+                    let temp_bytes = temp_file
+                        .read_bytes()
+                        .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
+                    let raw_slice = temp_bytes.as_slice();
+                    let doc_offsets = &temp_writer.doc_offsets;
+
+                    for old_doc_id in doc_id_map.iter_old_doc_ids() {
+                        let doc_idx = old_doc_id as usize;
+                        let start = doc_offsets[doc_idx] as usize;
+                        let end = doc_offsets[doc_idx + 1] as usize;
+                        store_writer
+                            .store_bytes(&raw_slice[start..end])
+                            .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
+                    }
+                    store_writer
                         .close()
                         .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
                 }
-
-                // Open the final store writer
-                let settings = segment.index().settings().clone();
-                let store_write = segment.open_write(SegmentComponent::Store)?;
-                let mut store_writer = StoreWriter::new(
-                    store_write,
-                    settings.docstore_compression,
-                    settings.docstore_blocksize,
-                    settings.docstore_compress_dedicated_thread,
-                )
-                .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
-
-                // Read from temp store and write in new order
-                let store_read = StoreReader::open(
-                    segment.open_read(SegmentComponent::TempStore)?,
-                    1, /* The docstore is configured to have one doc per block, and each doc is
-                        * accessed only once: we don't need caching. */
-                )?;
-                for old_doc_id in doc_id_map.iter_old_doc_ids() {
-                    let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
-                    store_writer
-                        .store_bytes(&doc_bytes)
-                        .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
-                }
-
-                // Replace the writer with the final store writer
-                self.store_writer = Some(store_writer);
             }
-        }
-        // For non-sorted indexes, data was already written incrementally.
-        if let Some(writer) = self.store_writer {
-            writer
-                .close()
-                .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
+            Some(ActiveStoreWriter::Direct(writer)) => {
+                writer
+                    .close()
+                    .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
+            }
+            None => {}
         }
         Ok(())
     }
 
     fn mem_usage(&self) -> usize {
-        let Some(writer) = self.store_writer.as_ref() else {
-            return 0;
-        };
-        writer.mem_usage()
+        match self.store_writer.as_ref() {
+            Some(ActiveStoreWriter::Direct(writer)) => writer.mem_usage(),
+            Some(ActiveStoreWriter::Temp(writer)) => writer.mem_usage(),
+            None => 0,
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -176,11 +176,13 @@ pub use self::de::{
     ValueDeserialize, ValueDeserializer, ValueType, ValueVisitor,
 };
 pub use self::default_document::{
-    CompactDocArrayIter, CompactDocObjectIter, CompactDocValue, DocParsingError, TantivyDocument,
+    CompactDocArrayIter, CompactDocObjectIter, CompactDocValue, CompactDocValueAddr,
+    CompactDocValueWriter, DocParsingError, TantivyDocument,
 };
 pub use self::erased::{ErasedDocument, ErasedValue};
+pub use self::existing_type_impls::try_parse_rfc3339_date_time;
 pub use self::owned_value::OwnedValue;
-pub(crate) use self::se::BinaryDocumentSerializer;
+pub(crate) use self::se::serialize_doc_to_vec;
 pub use self::value::{ReferenceValue, ReferenceValueLeaf, Value};
 use super::*;
 

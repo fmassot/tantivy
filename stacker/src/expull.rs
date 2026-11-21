@@ -77,6 +77,13 @@ fn ensure_capacity<'a>(
 impl ExpUnrolledLinkedListWriter<'_> {
     #[inline]
     pub fn write_u32_vint(&mut self, val: u32) {
+        if val < 128 && self.eull.remaining_cap >= 1 {
+            let output_buf = self.arena.slice_mut(self.eull.tail, 1);
+            output_buf[0] = (val as u8) | 0x80;
+            self.eull.remaining_cap -= 1;
+            self.eull.tail = self.eull.tail.offset(1);
+            return;
+        }
         let mut buf = [0u8; 8];
         let data = serialize_vint_u32(val, &mut buf);
         self.extend_from_slice(data);
@@ -84,6 +91,13 @@ impl ExpUnrolledLinkedListWriter<'_> {
 
     #[inline]
     pub fn extend_from_slice(&mut self, mut buf: &[u8]) {
+        if !buf.is_empty() && (self.eull.remaining_cap as usize) >= buf.len() {
+            let output_buf = self.arena.slice_mut(self.eull.tail, buf.len());
+            fast_short_slice_copy(buf, output_buf);
+            self.eull.remaining_cap -= buf.len() as u16;
+            self.eull.tail = self.eull.tail.offset(buf.len() as u32);
+            return;
+        }
         while !buf.is_empty() {
             let add_len: usize;
             {

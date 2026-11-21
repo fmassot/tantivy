@@ -23,14 +23,30 @@ use crate::schema::Field;
 use crate::tokenizer::PreTokenizedString;
 
 // Serde compatibility support.
+// Minimum valid RFC3339 timestamp is `YYYY-MM-DDTHH:MM:SSZ` (20 bytes) with `-` at 4, 7
+// and `:` at 13, 16. Checking those fixed separators rejects non-date numeric strings
+// (versions, UUIDs, trace IDs, integers) without invoking the RFC3339 parser.
+#[inline]
 pub fn can_be_rfc3339_date_time(text: &str) -> bool {
-    if let Some(&first_byte) = text.as_bytes().first() {
-        if first_byte.is_ascii_digit() {
-            return true;
-        }
-    }
+    let bytes = text.as_bytes();
+    bytes.len() >= 20
+        && bytes[0].is_ascii_digit()
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+}
 
-    false
+/// Parses an RFC3339 timestamp string into a UTC [`DateTime`], using a fast structural
+/// pre-check so non-date strings are rejected without invoking the full parser.
+#[inline]
+pub fn try_parse_rfc3339_date_time(text: &str) -> Option<DateTime> {
+    if !can_be_rfc3339_date_time(text) {
+        return None;
+    }
+    OffsetDateTime::parse(text, &Rfc3339)
+        .ok()
+        .and_then(|dt| DateTime::try_from_utc(dt.to_offset(time::UtcOffset::UTC)))
 }
 
 impl<'a> Value<'a> for &'a serde_json::Value {

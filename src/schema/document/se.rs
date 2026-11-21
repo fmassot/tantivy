@@ -5,16 +5,20 @@ use std::io::Write;
 use columnar::MonotonicallyMappableToU128;
 use common::{f64_to_u64, BinarySerializable, VInt};
 
-use super::{OwnedValue, ReferenceValueLeaf};
+#[cfg(test)]
+use super::OwnedValue;
+use super::ReferenceValueLeaf;
 use crate::schema::document::{type_codes, Document, ReferenceValue, Value};
 use crate::schema::Schema;
 
 /// A serializer writing documents which implement [`Document`] to a provided writer.
+#[cfg(test)]
 pub struct BinaryDocumentSerializer<'se, W> {
     writer: &'se mut W,
     schema: &'se Schema,
 }
 
+#[cfg(test)]
 impl<'se, W> BinaryDocumentSerializer<'se, W>
 where W: Write
 {
@@ -65,6 +69,188 @@ where W: Write
     }
 }
 
+/// Fast single-pass document serializer directly into a `&mut Vec<u8>`.
+///
+/// Avoids the double iteration over `doc.iter_fields_and_values()` and per-write `io::Result`
+/// error plumbing when writing into an in-memory buffer (as used by `StoreWriter` and
+/// `TempStoreWriter`).
+#[inline]
+pub(crate) fn serialize_doc_to_vec<D: Document>(
+    doc: &D,
+    schema: &Schema,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let count_pos = out.len();
+    // Reserve 1 byte for the common case (< 128 stored field values).
+    out.push(0);
+    let mut num_field_values: usize = 0;
+
+    for (field, value_access) in doc.iter_fields_and_values() {
+        if !schema.get_field_entry(field).is_stored() {
+            continue;
+        }
+        out.extend_from_slice(&field.field_id().to_le_bytes());
+        match value_access.as_value() {
+            ReferenceValue::Leaf(ReferenceValueLeaf::PreTokStr(pre_tokenized_text)) => {
+                push_bytes_with_type_code(
+                    out,
+                    type_codes::TEXT_CODE,
+                    pre_tokenized_text.text.as_bytes(),
+                );
+            }
+            val => serialize_value_to_vec(out, val)?,
+        }
+        num_field_values += 1;
+    }
+
+    if num_field_values < 128 {
+        out[count_pos] = (num_field_values as u8) | 0x80;
+    } else {
+        let mut vint_buf = [0u8; 8];
+        let len_bytes = common::serialize_vint_u32(num_field_values as u32, &mut vint_buf);
+        out.splice(count_pos..count_pos + 1, len_bytes.iter().copied());
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn push_collection_header(out: &mut Vec<u8>, code: u8, len: usize) {
+    if len < 128 {
+        out.extend_from_slice(&[code, (len as u8) | 0x80]);
+    } else {
+        let mut vint_buf = [0u8; 8];
+        let len_bytes = common::serialize_vint_u32(len as u32, &mut vint_buf);
+        out.push(code);
+        out.extend_from_slice(len_bytes);
+    }
+}
+
+#[inline(always)]
+fn push_bytes_with_type_code(out: &mut Vec<u8>, code: u8, bytes: &[u8]) {
+    let len = bytes.len();
+    if len < 128 {
+        out.reserve(2 + len);
+        out.extend_from_slice(&[code, (len as u8) | 0x80]);
+        out.extend_from_slice(bytes);
+    } else {
+        let mut vint_buf = [0u8; 8];
+        let len_bytes = common::serialize_vint_u32(len as u32, &mut vint_buf);
+        out.reserve(1 + len_bytes.len() + len);
+        out.push(code);
+        out.extend_from_slice(len_bytes);
+        out.extend_from_slice(bytes);
+    }
+}
+
+#[inline(always)]
+fn push_u64_with_type_code(out: &mut Vec<u8>, code: u8, val: u64) {
+    let b = val.to_le_bytes();
+    out.extend_from_slice(&[code, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+}
+
+#[inline]
+fn serialize_value_to_vec<'a, V: Value<'a>>(
+    out: &mut Vec<u8>,
+    value: ReferenceValue<'a, V>,
+) -> io::Result<()> {
+    match value {
+        ReferenceValue::Leaf(leaf) => match leaf {
+            ReferenceValueLeaf::Null => out.push(type_codes::NULL_CODE),
+            ReferenceValueLeaf::Str(val) => {
+                push_bytes_with_type_code(out, type_codes::TEXT_CODE, val.as_bytes());
+            }
+            ReferenceValueLeaf::U64(val) => {
+                push_u64_with_type_code(out, type_codes::U64_CODE, val);
+            }
+            ReferenceValueLeaf::I64(val) => {
+                push_u64_with_type_code(out, type_codes::I64_CODE, val as u64);
+            }
+            ReferenceValueLeaf::F64(val) => {
+                push_u64_with_type_code(out, type_codes::F64_CODE, f64_to_u64(val));
+            }
+            ReferenceValueLeaf::Date(val) => {
+                push_u64_with_type_code(
+                    out,
+                    type_codes::DATE_CODE,
+                    val.into_timestamp_nanos() as u64,
+                );
+            }
+            ReferenceValueLeaf::Facet(val) => {
+                push_bytes_with_type_code(out, type_codes::HIERARCHICAL_FACET_CODE, val.as_bytes());
+            }
+            ReferenceValueLeaf::Bytes(val) => {
+                push_bytes_with_type_code(out, type_codes::BYTES_CODE, val);
+            }
+            ReferenceValueLeaf::IpAddr(val) => {
+                out.push(type_codes::IP_CODE);
+                out.extend_from_slice(&val.to_u128().to_le_bytes());
+            }
+            ReferenceValueLeaf::Bool(val) => {
+                out.extend_from_slice(&[type_codes::BOOL_CODE, val as u8]);
+            }
+            ReferenceValueLeaf::PreTokStr(val) => {
+                out.push(type_codes::EXT_CODE);
+                out.push(type_codes::TOK_STR_EXT_CODE);
+                BinarySerializable::serialize(&*val, out)?;
+            }
+            ReferenceValueLeaf::Custom(_) => {
+                return Err(io::Error::other(
+                    "the store does not support custom field types",
+                ));
+            }
+        },
+        ReferenceValue::Array(elements) => {
+            let (lower, upper) = elements.size_hint();
+            if upper == Some(lower) {
+                push_collection_header(out, type_codes::ARRAY_CODE, lower);
+                let mut actual_length = 0;
+                for elem in elements {
+                    serialize_value_to_vec(out, elem.as_value())?;
+                    actual_length += 1;
+                }
+                if lower != actual_length {
+                    return Err(io::Error::other(format!(
+                        "Unexpected number of entries written to serializer, expected {lower} \
+                         entries, got {actual_length} entries",
+                    )));
+                }
+            } else {
+                let elements: Vec<V> = elements.collect();
+                push_collection_header(out, type_codes::ARRAY_CODE, elements.len());
+                for elem in elements {
+                    serialize_value_to_vec(out, elem.as_value())?;
+                }
+            }
+        }
+        ReferenceValue::Object(object) => {
+            let (lower, upper) = object.size_hint();
+            if upper == Some(lower) {
+                push_collection_header(out, type_codes::OBJECT_CODE, lower * 2);
+                let mut actual_length = 0;
+                for (key, val) in object {
+                    push_bytes_with_type_code(out, type_codes::TEXT_CODE, key.as_bytes());
+                    serialize_value_to_vec(out, val.as_value())?;
+                    actual_length += 1;
+                }
+                if lower != actual_length {
+                    return Err(io::Error::other(format!(
+                        "Unexpected number of entries written to serializer, expected {lower} \
+                         entries, got {actual_length} entries",
+                    )));
+                }
+            } else {
+                let entries: Vec<(&str, V)> = object.collect();
+                push_collection_header(out, type_codes::OBJECT_CODE, entries.len() * 2);
+                for (key, val) in entries {
+                    push_bytes_with_type_code(out, type_codes::TEXT_CODE, key.as_bytes());
+                    serialize_value_to_vec(out, val.as_value())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A serializer for a single value.
 pub struct BinaryValueSerializer<'se, W> {
     writer: &'se mut W,
@@ -87,8 +273,37 @@ where W: Write
         BinarySerializable::serialize(val, self.writer)
     }
 
+    #[inline]
+    fn serialize_u64_with_type_code(&mut self, code: u8, val: u64) -> io::Result<()> {
+        let b = val.to_le_bytes();
+        self.writer
+            .write_all(&[code, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    }
+
+    #[inline]
+    fn serialize_collection_header(&mut self, code: u8, len: usize) -> io::Result<()> {
+        if len < 128 {
+            // Tantivy VInt sets the high bit (0x80) on the final byte.
+            self.writer.write_all(&[code, (len as u8) | 0x80])
+        } else {
+            let mut vint_buf = [0u8; 8];
+            let len_bytes = common::serialize_vint_u32(len as u32, &mut vint_buf);
+            let mut header = [0u8; 9];
+            header[0] = code;
+            header[1..1 + len_bytes.len()].copy_from_slice(len_bytes);
+            self.writer.write_all(&header[..1 + len_bytes.len()])
+        }
+    }
+
+    #[inline]
+    fn serialize_bytes_with_type_code(&mut self, code: u8, bytes: &[u8]) -> io::Result<()> {
+        self.serialize_collection_header(code, bytes.len())?;
+        self.writer.write_all(bytes)
+    }
+
     /// Attempts to serialize a given value and write the output
     /// to the writer.
+    #[inline]
     pub(crate) fn serialize_value<'a, V>(
         &mut self,
         value: ReferenceValue<'a, V>,
@@ -100,34 +315,33 @@ where W: Write
             ReferenceValue::Leaf(leaf) => match leaf {
                 ReferenceValueLeaf::Null => self.write_type_code(type_codes::NULL_CODE),
                 ReferenceValueLeaf::Str(val) => {
-                    self.serialize_with_type_code(type_codes::TEXT_CODE, &Cow::Borrowed(val))
+                    self.serialize_bytes_with_type_code(type_codes::TEXT_CODE, val.as_bytes())
                 }
                 ReferenceValueLeaf::U64(val) => {
-                    self.serialize_with_type_code(type_codes::U64_CODE, &val)
+                    self.serialize_u64_with_type_code(type_codes::U64_CODE, val)
                 }
                 ReferenceValueLeaf::I64(val) => {
-                    self.serialize_with_type_code(type_codes::I64_CODE, &val)
+                    self.serialize_u64_with_type_code(type_codes::I64_CODE, val as u64)
                 }
                 ReferenceValueLeaf::F64(val) => {
-                    self.serialize_with_type_code(type_codes::F64_CODE, &f64_to_u64(val))
+                    self.serialize_u64_with_type_code(type_codes::F64_CODE, f64_to_u64(val))
                 }
                 ReferenceValueLeaf::Date(val) => {
-                    self.write_type_code(type_codes::DATE_CODE)?;
                     let timestamp_nanos: i64 = val.into_timestamp_nanos();
-                    BinarySerializable::serialize(&timestamp_nanos, self.writer)
+                    self.serialize_u64_with_type_code(type_codes::DATE_CODE, timestamp_nanos as u64)
                 }
                 ReferenceValueLeaf::Facet(val) => self.serialize_with_type_code(
                     type_codes::HIERARCHICAL_FACET_CODE,
                     &Cow::Borrowed(val),
                 ),
                 ReferenceValueLeaf::Bytes(val) => {
-                    self.serialize_with_type_code(type_codes::BYTES_CODE, &Cow::Borrowed(val))
+                    self.serialize_bytes_with_type_code(type_codes::BYTES_CODE, val)
                 }
                 ReferenceValueLeaf::IpAddr(val) => {
                     self.serialize_with_type_code(type_codes::IP_CODE, &val.to_u128())
                 }
                 ReferenceValueLeaf::Bool(val) => {
-                    self.serialize_with_type_code(type_codes::BOOL_CODE, &val)
+                    self.writer.write_all(&[type_codes::BOOL_CODE, val as u8])
                 }
                 ReferenceValueLeaf::PreTokStr(val) => {
                     self.write_type_code(type_codes::EXT_CODE)?;
@@ -141,34 +355,57 @@ where W: Write
                 )),
             },
             ReferenceValue::Array(elements) => {
-                self.write_type_code(type_codes::ARRAY_CODE)?;
-
-                // Somewhat unfortunate that we do this here however, writing the
-                // length at the end of the complicates things quite considerably.
-                let elements: Vec<V> = elements.collect();
-
-                let mut serializer = BinaryArraySerializer::begin(elements.len(), self.writer)?;
-
-                for value in elements {
-                    serializer.serialize_value(value.as_value())?;
+                let (lower, upper) = elements.size_hint();
+                if upper == Some(lower) {
+                    self.serialize_collection_header(type_codes::ARRAY_CODE, lower)?;
+                    let mut actual_length = 0;
+                    for value in elements {
+                        self.serialize_value(value.as_value())?;
+                        actual_length += 1;
+                    }
+                    if lower != actual_length {
+                        return Err(io::Error::other(format!(
+                            "Unexpected number of entries written to serializer, expected {lower} \
+                             entries, got {actual_length} entries",
+                        )));
+                    }
+                    Ok(())
+                } else {
+                    let elements: Vec<V> = elements.collect();
+                    self.serialize_collection_header(type_codes::ARRAY_CODE, elements.len())?;
+                    for value in elements {
+                        self.serialize_value(value.as_value())?;
+                    }
+                    Ok(())
                 }
-
-                serializer.end()
             }
             ReferenceValue::Object(object) => {
-                self.write_type_code(type_codes::OBJECT_CODE)?;
-
-                // Somewhat unfortunate that we do this here however, writing the
-                // length at the end of the complicates things quite considerably.
-                let entries: Vec<(&str, V)> = object.collect();
-
-                let mut serializer = BinaryObjectSerializer::begin(entries.len(), self.writer)?;
-
-                for (key, value) in entries {
-                    serializer.serialize_entry(key, value.as_value())?;
+                let (lower, upper) = object.size_hint();
+                if upper == Some(lower) {
+                    // Keys and values are counted separately (`length * 2`).
+                    self.serialize_collection_header(type_codes::OBJECT_CODE, lower * 2)?;
+                    let mut actual_length = 0;
+                    for (key, value) in object {
+                        self.serialize_bytes_with_type_code(type_codes::TEXT_CODE, key.as_bytes())?;
+                        self.serialize_value(value.as_value())?;
+                        actual_length += 1;
+                    }
+                    if lower != actual_length {
+                        return Err(io::Error::other(format!(
+                            "Unexpected number of entries written to serializer, expected {lower} \
+                             entries, got {actual_length} entries",
+                        )));
+                    }
+                    Ok(())
+                } else {
+                    let entries: Vec<(&str, V)> = object.collect();
+                    self.serialize_collection_header(type_codes::OBJECT_CODE, entries.len() * 2)?;
+                    for (key, value) in entries {
+                        self.serialize_bytes_with_type_code(type_codes::TEXT_CODE, key.as_bytes())?;
+                        self.serialize_value(value.as_value())?;
+                    }
+                    Ok(())
                 }
-
-                serializer.end()
             }
         }
     }
@@ -262,11 +499,9 @@ where W: Write
         V: Value<'a>,
     {
         // Keys and values are stored inline with one another.
-        // Technically this isn't the *most* optimal way of storing the objects
-        // as we could avoid writing the extra byte per key. But the gain is
-        // largely not worth it for the extra complexity it brings.
-        self.inner
-            .serialize_value(ReferenceValue::<'a, V>::Leaf(ReferenceValueLeaf::Str(key)))?;
+        let mut key_serializer = BinaryValueSerializer::new(self.inner.writer);
+        key_serializer.serialize_bytes_with_type_code(type_codes::TEXT_CODE, key.as_bytes())?;
+        self.inner.actual_length += 1;
         self.inner.serialize_value(value)?;
 
         self.actual_length += 1;
@@ -669,6 +904,14 @@ mod tests {
 
         let mut serializer = BinaryDocumentSerializer::new(&mut writer, schema);
         serializer.serialize_doc(doc).expect("Serialize value");
+
+        let mut fast_writer = Vec::new();
+        serialize_doc_to_vec(doc, schema, &mut fast_writer).expect("Fast serialize doc");
+        assert_eq!(
+            fast_writer, writer,
+            "serialize_doc_to_vec must produce byte-for-byte identical output to \
+             BinaryDocumentSerializer"
+        );
 
         writer
     }
