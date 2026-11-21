@@ -160,6 +160,101 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         }
     }
 
+    /// Partitions the blocks matching `automaton` into up to `max_chunks` contiguous chunks when
+    /// the total matched byte volume is at least `2 * min_bytes_per_chunk`, returning per-chunk
+    /// `(OwnedBytes, first_ordinal)` slices ready for parallel scanning.
+    ///
+    /// Returns `Ok(None)` when the total volume is small enough to scan in a single pass.
+    pub fn automaton_block_chunks(
+        &self,
+        automaton: &impl Automaton,
+        max_chunks: usize,
+        min_bytes_per_chunk: usize,
+    ) -> io::Result<Option<Vec<Vec<(OwnedBytes, u64)>>>> {
+        if max_chunks <= 1 || automaton.will_always_match(&automaton.start()) {
+            return Ok(None);
+        }
+        let blocks: Vec<BlockAddr> = self
+            .sstable_index
+            .get_block_for_automaton(automaton)
+            .map(|(_, block_addr)| block_addr)
+            .collect();
+        let total_bytes: usize = blocks.iter().map(|b| b.byte_range.len()).sum();
+        if total_bytes < min_bytes_per_chunk.saturating_mul(2) || blocks.len() < 2 {
+            return Ok(None);
+        }
+        let num_chunks = (total_bytes / min_bytes_per_chunk).clamp(2, max_chunks);
+        let target_bytes = total_bytes.div_ceil(num_chunks);
+
+        let mut chunks: Vec<Vec<(OwnedBytes, u64)>> = Vec::with_capacity(num_chunks);
+        let mut cur_slices: Vec<(OwnedBytes, u64)> = Vec::new();
+        let mut cur_bytes: usize = 0;
+        let mut merged_range: Option<(std::ops::Range<usize>, u64)> = None;
+
+        let flush_merged = |merged: &mut Option<(std::ops::Range<usize>, u64)>,
+                            out: &mut Vec<(OwnedBytes, u64)>|
+         -> io::Result<()> {
+            if let Some((range, first_ord)) = merged.take() {
+                let bytes = self.sstable_slice.read_bytes_slice(range)?;
+                out.push((bytes, first_ord));
+            }
+            Ok(())
+        };
+
+        for block in blocks {
+            let block_len = block.byte_range.len();
+            if cur_bytes >= target_bytes && chunks.len() + 1 < num_chunks {
+                flush_merged(&mut merged_range, &mut cur_slices)?;
+                if !cur_slices.is_empty() {
+                    chunks.push(std::mem::take(&mut cur_slices));
+                }
+                cur_bytes = 0;
+            }
+            match &mut merged_range {
+                Some((range, _)) if range.end == block.byte_range.start => {
+                    range.end = block.byte_range.end;
+                }
+                _ => {
+                    flush_merged(&mut merged_range, &mut cur_slices)?;
+                    merged_range = Some((block.byte_range, block.first_ordinal));
+                }
+            }
+            cur_bytes += block_len;
+        }
+        flush_merged(&mut merged_range, &mut cur_slices)?;
+        if !cur_slices.is_empty() {
+            chunks.push(cur_slices);
+        }
+        if chunks.len() <= 1 {
+            return Ok(None);
+        }
+        Ok(Some(chunks))
+    }
+
+    /// Streams all values matching `automaton` from pre-fetched SSTable block slices without
+    /// reconstructing keys.
+    pub fn stream_values_from_slices<A>(
+        &self,
+        slices: Vec<(OwnedBytes, u64)>,
+        automaton: A,
+    ) -> io::Result<Vec<TSSTable::Value>>
+    where
+        A: Automaton,
+        A::State: Clone,
+        TSSTable::Value: Clone,
+    {
+        let delta_reader = DeltaReader::<TSSTable::ValueReader>::from_multiple_blocks(slices);
+        let mut streamer = self
+            .search(automaton)
+            .without_keys()
+            .into_stream_given_delta_reader(delta_reader)?;
+        let mut values = Vec::new();
+        while let Some(value) = streamer.next_without_key() {
+            values.push(value.clone());
+        }
+        Ok(values)
+    }
+
     pub(crate) fn sstable_delta_reader_block(
         &self,
         block_addr: BlockAddr,
@@ -619,10 +714,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
-    pub fn search<'a, A: Automaton + 'a>(
-        &'a self,
-        automaton: A,
-    ) -> StreamerBuilder<'a, TSSTable, A>
+    pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> StreamerBuilder<'a, TSSTable, A>
     where
         A::State: Clone,
     {

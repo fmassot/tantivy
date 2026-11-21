@@ -1,4 +1,6 @@
 use std::io;
+#[cfg(feature = "quickwit")]
+use std::sync::Arc;
 
 use common::json_path_writer::JSON_END_OF_PATH;
 use common::{BinarySerializable, ByteCount};
@@ -455,8 +457,6 @@ impl InvertedIndexReader {
     where
         A::State: Clone,
     {
-        // We build a first iterator to download everything. Simply calling the function already
-        // download everything we need from the sstable, but doesn't start iterating over it.
         let _term_info_iter = self
             .get_term_range_async(.., automaton.clone(), None, MERGE_HOLES_UNDER_BYTES)
             .await?;
@@ -464,17 +464,8 @@ impl InvertedIndexReader {
         let (sender, posting_ranges_to_load_stream) = futures_channel::mpsc::unbounded();
         let termdict = self.termdict.clone();
         let cpu_bound_task = move || {
-            // then we build a 2nd iterator, this one with no holes, so we don't go through blocks
-            // we can't match.
-            // This makes the assumption there is a caching layer below us, which gives sync read
-            // for free after the initial async access. This might not always be true, but is in
-            // Quickwit.
-            // We build things from this closure otherwise we get into lifetime issues that can only
-            // be solved with self referential strucs. Returning an io::Result from here is a bit
-            // more leaky abstraction-wise, but a lot better than the alternative
             let mut stream = termdict.search(automaton).without_keys().into_stream()?;
-
-            let posting_ranges = std::iter::from_fn(move || {
+            let posting_ranges = std::iter::from_fn(|| {
                 stream
                     .next_without_key()
                     .map(|value| value.postings_range.clone())
@@ -483,12 +474,107 @@ impl InvertedIndexReader {
         };
         let task_handle = executor(Box::new(cpu_bound_task));
 
-        let (_, postings_found) = futures_util::future::try_join(
+        let (_, found_any) = futures_util::future::try_join(
             task_handle,
             self.download_posting_ranges(posting_ranges_to_load_stream),
         )
         .await?;
-        Ok(postings_found)
+        Ok(found_any)
+    }
+
+    /// Warms postings for one automaton and returns all matched [`TermInfo`] entries so callers
+    /// can reuse them during search without scanning the term dictionary a second time.
+    ///
+    /// When the automaton scans a large portion of the term dictionary (`>= 12 MiB` compressed),
+    /// the SSTable blocks are partitioned into up to 4 independent chunks and scanned in parallel
+    /// via `executor`.
+    pub async fn warm_postings_automaton_collecting_term_infos<
+        A: Automaton + Clone + Send + 'static,
+        E: Fn(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
+        F: std::future::Future<Output = io::Result<()>>,
+    >(
+        &self,
+        automaton: A,
+        executor: E,
+    ) -> io::Result<Vec<TermInfo>>
+    where
+        A::State: Clone,
+    {
+        // We build a first iterator to download everything. Simply calling the function already
+        // download everything we need from the sstable, but doesn't start iterating over it.
+        let _term_info_iter = self
+            .get_term_range_async(.., automaton.clone(), None, MERGE_HOLES_UNDER_BYTES)
+            .await?;
+
+        const MIN_BYTES_PER_CHUNK: usize = 6 * 1024 * 1024;
+        const MAX_CHUNKS: usize = 4;
+        if let Some(chunks) =
+            self.termdict
+                .automaton_block_chunks(&automaton, MAX_CHUNKS, MIN_BYTES_PER_CHUNK)?
+        {
+            let num_chunks = chunks.len();
+            let chunk_results: Vec<Arc<std::sync::Mutex<Vec<TermInfo>>>> = (0..num_chunks)
+                .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
+                .collect();
+            let mut chunk_futures = Vec::with_capacity(num_chunks);
+            for (slices, out_slot) in chunks.into_iter().zip(chunk_results.iter().cloned()) {
+                let termdict = self.termdict.clone();
+                let automaton_clone = automaton.clone();
+                chunk_futures.push(executor(Box::new(move || {
+                    let matched = termdict.stream_values_from_slices(slices, automaton_clone)?;
+                    *out_slot.lock().unwrap() = matched;
+                    Ok(())
+                })));
+            }
+            futures_util::future::try_join_all(chunk_futures).await?;
+
+            let mut all_term_infos = Vec::new();
+            for slot in chunk_results {
+                let chunk_infos = Arc::try_unwrap(slot)
+                    .expect("chunk task has completed")
+                    .into_inner()
+                    .unwrap();
+                all_term_infos.extend(chunk_infos);
+            }
+            let (sender, posting_ranges_to_load_stream) = futures_channel::mpsc::unbounded();
+            send_coalesced_posting_ranges(
+                all_term_infos.iter().map(|ti| ti.postings_range.clone()),
+                sender,
+            )?;
+            self.download_posting_ranges(posting_ranges_to_load_stream)
+                .await?;
+            return Ok(all_term_infos);
+        }
+
+        let (sender, posting_ranges_to_load_stream) = futures_channel::mpsc::unbounded();
+        let termdict = self.termdict.clone();
+        let collected_term_infos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_term_infos_clone = collected_term_infos.clone();
+        let cpu_bound_task = move || {
+            let mut stream = termdict.search(automaton).without_keys().into_stream()?;
+            let mut local_term_infos = Vec::new();
+            let posting_ranges = std::iter::from_fn(|| {
+                stream.next_without_key().map(|value| {
+                    local_term_infos.push(value.clone());
+                    value.postings_range.clone()
+                })
+            });
+            let res = send_coalesced_posting_ranges(posting_ranges, sender);
+            *collected_term_infos_clone.lock().unwrap() = local_term_infos;
+            res
+        };
+        let task_handle = executor(Box::new(cpu_bound_task));
+
+        let (_, _) = futures_util::future::try_join(
+            task_handle,
+            self.download_posting_ranges(posting_ranges_to_load_stream),
+        )
+        .await?;
+        let term_infos = Arc::try_unwrap(collected_term_infos)
+            .expect("automaton warmup task has completed")
+            .into_inner()
+            .unwrap();
+        Ok(term_infos)
     }
 
     /// Warms postings for one automaton and returns a bitset of matching document IDs.

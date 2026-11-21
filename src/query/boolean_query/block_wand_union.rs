@@ -215,6 +215,104 @@ pub fn block_wand(
     }
 }
 
+/// Block-Max WAND for minimum-should-match disjunctions (`minimum_matches_required >= 2`)
+/// over `TermScorer`s with sum scoring.
+pub fn block_wand_disjunction(
+    mut scorers: Vec<TermScorer>,
+    minimum_matches_required: usize,
+    mut threshold: Score,
+    callback: &mut dyn FnMut(u32, Score) -> Score,
+) {
+    scorers.retain(|scorer| scorer.doc() < TERMINATED);
+    if scorers.len() < minimum_matches_required {
+        return;
+    }
+    let mut scorers: Vec<TermScorerWithMaxScore> = scorers
+        .iter_mut()
+        .map(TermScorerWithMaxScore::from)
+        .collect();
+    scorers.sort_by_key(|scorer| scorer.doc());
+
+    while scorers.len() >= minimum_matches_required {
+        // Find the lowest pivot doc where at least `minimum_matches_required` scorers have
+        // `doc() <= pivot_doc` AND the sum of their global max_scores exceeds `threshold`.
+        let mut max_score_sum = 0.0f32;
+        let mut before_pivot_len = 0usize;
+        let mut pivot_doc = TERMINATED;
+        while before_pivot_len < scorers.len() {
+            let term_scorer = &scorers[before_pivot_len];
+            max_score_sum += term_scorer.max_score;
+            if before_pivot_len + 1 >= minimum_matches_required && max_score_sum > threshold {
+                pivot_doc = term_scorer.doc();
+                break;
+            }
+            before_pivot_len += 1;
+        }
+        if pivot_doc == TERMINATED {
+            return;
+        }
+        let mut pivot_len = before_pivot_len + 1;
+        pivot_len += scorers[pivot_len..]
+            .iter()
+            .take_while(|term_scorer| term_scorer.doc() == pivot_doc)
+            .count();
+
+        let block_max_score_upperbound: Score = scorers[..pivot_len]
+            .iter_mut()
+            .map(|scorer| {
+                scorer.seek_block(pivot_doc);
+                scorer.block_max_score()
+            })
+            .sum();
+
+        if block_max_score_upperbound <= threshold {
+            block_max_was_too_low_advance_one_scorer(&mut scorers, pivot_len);
+            scorers.retain(|scorer| scorer.doc() != TERMINATED);
+            continue;
+        }
+
+        // Count scorers already positioned at `pivot_doc`, then seek scorers before the pivot.
+        let mut num_matched = pivot_len - before_pivot_len;
+        let mut score: Score = 0.0;
+        let mut remaining_before = before_pivot_len;
+        for scorer in &mut scorers[..before_pivot_len] {
+            if num_matched + remaining_before < minimum_matches_required {
+                break;
+            }
+            remaining_before -= 1;
+            if scorer.seek(pivot_doc) == pivot_doc {
+                num_matched += 1;
+                score += scorer.score();
+            }
+        }
+        if num_matched >= minimum_matches_required {
+            for scorer in &mut scorers[before_pivot_len..pivot_len] {
+                score += scorer.score();
+            }
+            if score > threshold {
+                threshold = callback(pivot_doc, score);
+            }
+        }
+
+        // Advance only scorers currently sitting at `pivot_doc`; any scorer that sought past
+        // `pivot_doc` stays at its new position.
+        for scorer in &mut scorers[..pivot_len] {
+            if scorer.doc() == pivot_doc {
+                scorer.advance();
+            }
+        }
+        let mut idx = 0;
+        while idx != scorers.len() {
+            if scorers[idx].doc() == TERMINATED {
+                scorers.swap_remove(idx);
+            } else {
+                idx += 1;
+            }
+        }
+        scorers.sort_by_key(|scorer| scorer.doc());
+    }
+}
+
 /// Specialized version of [`block_wand`] for a single scorer.
 /// In this case, the algorithm is simple, readable and faster (~ x3)
 /// than the generic algorithm.

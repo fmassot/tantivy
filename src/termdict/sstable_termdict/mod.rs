@@ -57,8 +57,12 @@ impl ValueReader for TermInfoValueReader {
         let len_before = data.len();
         self.term_infos.clear();
         let num_els = VInt::deserialize_u64(&mut data)?;
+        if num_els == 0 {
+            return Ok(len_before - data.len());
+        }
         let mut postings_start = VInt::deserialize_u64(&mut data)? as usize;
         let mut positions_start = VInt::deserialize_u64(&mut data)? as usize;
+        self.term_infos.reserve(num_els as usize);
         for _ in 0..num_els {
             let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
             let postings_num_bytes = VInt::deserialize_u64(&mut data)?;
@@ -76,6 +80,45 @@ impl ValueReader for TermInfoValueReader {
         }
         let consumed_len = len_before - data.len();
         Ok(consumed_len)
+    }
+
+    fn skip(&self, mut data: &[u8]) -> Option<io::Result<usize>> {
+        let len_before = data.len();
+        let num_els = match VInt::deserialize_u64(&mut data) {
+            Ok(num_els) => num_els,
+            Err(err) => return Some(Err(err)),
+        };
+        if num_els == 0 {
+            return Some(Ok(len_before - data.len()));
+        }
+        // Format: postings_start, positions_start, then 3 VInts per element.
+        // Each `common::VInt` terminates on a byte with MSB == 1 (`b >= 0x80`).
+        let mut remaining_vints = 2 + 3 * num_els;
+        let mut offset = 0usize;
+        const MSB_MASK: u64 = 0x8080_8080_8080_8080;
+        while offset + 8 <= data.len() {
+            let word = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            let stop_count = (word & MSB_MASK).count_ones() as u64;
+            if stop_count < remaining_vints {
+                remaining_vints -= stop_count;
+                offset += 8;
+            } else {
+                break;
+            }
+        }
+        while remaining_vints > 0 {
+            let Some(&byte) = data.get(offset) else {
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF while skipping TermInfo VInts",
+                )));
+            };
+            offset += 1;
+            if byte >= 0x80 {
+                remaining_vints -= 1;
+            }
+        }
+        Some(Ok((len_before - data.len()) + offset))
     }
 }
 

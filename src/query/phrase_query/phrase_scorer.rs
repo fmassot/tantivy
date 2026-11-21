@@ -23,6 +23,11 @@ impl<TPostings: Postings> PostingsWithOffset<TPostings> {
     pub fn positions(&mut self, output: &mut Vec<u32>) {
         self.postings.positions_with_offset(self.offset, output)
     }
+
+    #[inline]
+    pub fn single_position(&mut self) -> Option<u32> {
+        self.postings.single_position_with_offset(self.offset)
+    }
 }
 
 impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
@@ -58,6 +63,9 @@ pub struct PhraseScorer<TPostings: Postings> {
     left_slops: Vec<u8>,
     positions_buffer: Vec<u32>,
     slops_buffer: Vec<u8>,
+    /// Set when the single-position exact-phrase fast path matched so `get_intersection()`
+    /// (used by `PhrasePrefixScorer`) can materialize the matching position lazily.
+    single_match_pos: Option<u32>,
 }
 
 /// Returns true if and only if the two sorted arrays contain a common element
@@ -110,6 +118,11 @@ pub(crate) fn intersection_count(left: &[u32], right: &[u32]) -> usize {
 /// resulting array in left.
 ///
 /// Returns the length of the intersection
+#[inline]
+pub(crate) fn intersect_positions(left: &mut Vec<u32>, right: &[u32]) {
+    intersection(left, right);
+}
+
 #[inline]
 fn intersection(left: &mut Vec<u32>, right: &[u32]) {
     let mut left_index = 0;
@@ -440,6 +453,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             left_slops: Vec::with_capacity(100),
             slops_buffer: Vec::with_capacity(100),
             positions_buffer: Vec::with_capacity(100),
+            single_match_pos: None,
         };
         let doc = scorer.doc();
         debug_assert!(doc >= target);
@@ -462,6 +476,11 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     pub(crate) fn get_intersection(&mut self) -> &[u32] {
+        if let Some(pos) = self.single_match_pos.take() {
+            self.left_positions.clear();
+            self.left_positions.push(pos);
+            return &self.left_positions;
+        }
         intersection(&mut self.left_positions, &self.right_positions);
         &self.left_positions
     }
@@ -476,7 +495,55 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         }
     }
 
+    /// Fast path for exact phrases (`slop == 0`) when the rarest term (index 0) occurs only once
+    /// in the current document: the phrase can match at most once, and we can bail out on the
+    /// first mismatching term without decoding positions for subsequent terms.
+    #[inline]
+    fn try_single_pos_exact_match(&mut self) -> Option<bool> {
+        let pos0 = self
+            .intersection_docset
+            .docset_mut_specialized(0)
+            .single_position()?;
+        for i in 1..self.num_terms {
+            let postings = self.intersection_docset.docset_mut_specialized(i);
+            if let Some(pos_i) = postings.single_position() {
+                if pos_i != pos0 {
+                    self.single_match_pos = None;
+                    return Some(false);
+                }
+            } else {
+                postings.positions(&mut self.right_positions);
+                if self.right_positions.binary_search(&pos0).is_err() {
+                    self.single_match_pos = None;
+                    return Some(false);
+                }
+            }
+        }
+        self.single_match_pos = Some(pos0);
+        Some(true)
+    }
+
     fn phrase_exists(&mut self) -> bool {
+        self.single_match_pos = None;
+        if !self.has_slop() {
+            if let Some(matched) = self.try_single_pos_exact_match() {
+                return matched;
+            }
+        } else if self.num_terms == 2 {
+            if let Some(pos0) = self
+                .intersection_docset
+                .docset_mut_specialized(0)
+                .single_position()
+            {
+                if let Some(pos1) = self
+                    .intersection_docset
+                    .docset_mut_specialized(1)
+                    .single_position()
+                {
+                    return pos0.abs_diff(pos1) <= self.slop;
+                }
+            }
+        }
         self.compute_phrase_match();
         if self.has_slop() {
             intersection_exists_with_slop(
@@ -490,6 +557,26 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn compute_phrase_count(&mut self) -> u32 {
+        self.single_match_pos = None;
+        if !self.has_slop() {
+            if let Some(matched) = self.try_single_pos_exact_match() {
+                return u32::from(matched);
+            }
+        } else if self.num_terms == 2 {
+            if let Some(pos0) = self
+                .intersection_docset
+                .docset_mut_specialized(0)
+                .single_position()
+            {
+                if let Some(pos1) = self
+                    .intersection_docset
+                    .docset_mut_specialized(1)
+                    .single_position()
+                {
+                    return u32::from(pos0.abs_diff(pos1) <= self.slop);
+                }
+            }
+        }
         self.compute_phrase_match();
         if self.has_slop() {
             if self.num_terms > 2 {

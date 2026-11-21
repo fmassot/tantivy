@@ -166,7 +166,7 @@ where
             .await
     }
 
-    fn into_stream_given_delta_reader(
+    pub(crate) fn into_stream_given_delta_reader(
         self,
         delta_reader: DeltaReader<<TSSTable as SSTable>::ValueReader>,
     ) -> io::Result<Streamer<'a, TSSTable, A, K>> {
@@ -193,6 +193,7 @@ where
             automaton: self.automaton,
             states: vec![start_state],
             always_match_at,
+            dead_at: None,
             delta_reader,
             key: K::make_default(),
             term_ord: first_term.checked_sub(1),
@@ -248,16 +249,21 @@ where
     _lifetime: std::marker::PhantomData<&'a ()>,
     lower_bound_reached: bool,
     always_match_at: Option<usize>,
+    /// Prefix length at which `automaton.can_match` became false, allowing subsequent keys
+    /// sharing that prefix to skip automaton state transitions.
+    dead_at: Option<usize>,
 }
 
 impl<TSSTable> Streamer<'_, TSSTable, AlwaysMatch>
-where TSSTable: SSTable
+where
+    TSSTable: SSTable,
 {
     pub fn empty() -> Self {
         Streamer {
             automaton: AlwaysMatch,
             states: vec![AlwaysMatch.start()],
             always_match_at: Some(0),
+            dead_at: None,
             delta_reader: DeltaReader::empty(),
             key: Vec::new(),
             term_ord: None,
@@ -279,7 +285,7 @@ where
 {
     #[inline(always)]
     fn advance_delta_reader(&mut self) -> bool {
-        if !self.delta_reader.advance().unwrap() {
+        if !self.delta_reader.advance_lazy().unwrap() {
             return false;
         }
         // An automaton prunes whole blocks, so the ordinal is not simply the previous one
@@ -353,6 +359,7 @@ where
                 return false;
             }
             if self.automaton.is_match(self.states.last().unwrap()) {
+                self.delta_reader.ensure_values_loaded().unwrap();
                 return true;
             }
         }
@@ -375,7 +382,11 @@ where
         if !self.advance_delta_reader() {
             return false;
         }
-        self.reconstruct_key_and_check_upper_bound::<NO_BOUND>()
+        if !self.reconstruct_key_and_check_upper_bound::<NO_BOUND>() {
+            return false;
+        }
+        self.delta_reader.ensure_values_loaded().unwrap();
+        true
     }
 
     fn advance_with_automaton<const NO_BOUND: bool>(&mut self) -> bool {
@@ -387,7 +398,11 @@ where
             let common_prefix_len = self.delta_reader.common_prefix_len();
             if always_match_at <= common_prefix_len {
                 self.always_match_at = Some(always_match_at);
-                return self.reconstruct_key_and_check_upper_bound::<NO_BOUND>();
+                if !self.reconstruct_key_and_check_upper_bound::<NO_BOUND>() {
+                    return false;
+                }
+                self.delta_reader.ensure_values_loaded().unwrap();
+                return true;
             }
         } else if !self.advance_delta_reader() {
             return false;
@@ -395,16 +410,46 @@ where
 
         loop {
             let common_prefix_len = self.delta_reader.common_prefix_len();
-            self.states.truncate(common_prefix_len + 1);
-            // TODO we could detect when we reach a !can_match, and skip both state and key
-            // computation until we truncate that can_t_match out of our state. it's already
-            // done at the block layer, so not as important
-            let mut state: A::State = self.states.last().unwrap().clone();
-            for &b in self.delta_reader.suffix() {
-                state = self.automaton.accept(&state, b);
-                self.states.push(state.clone());
+            if let Some(dead_at) = self.dead_at {
+                if common_prefix_len >= dead_at {
+                    if !NO_BOUND
+                        && !matches_upper_bound(
+                            &mut self.upper_bound_comparator,
+                            &self.upper_bound,
+                            common_prefix_len,
+                            self.delta_reader.suffix(),
+                        )
+                    {
+                        return false;
+                    }
+                    if !self.advance_delta_reader() {
+                        return false;
+                    }
+                    continue;
+                }
+                self.dead_at = None;
             }
-            let matches = self.automaton.is_match(&state);
+
+            self.states.truncate(common_prefix_len + 1);
+            let mut state: A::State = self.states.last().unwrap().clone();
+            let mut is_dead = !self.automaton.can_match(&state);
+            if is_dead {
+                self.dead_at = Some(common_prefix_len);
+            } else {
+                let suffix = self.delta_reader.suffix();
+                self.states.reserve(suffix.len());
+                for &b in suffix {
+                    state = self.automaton.accept(&state, b);
+                    self.states.push(state.clone());
+                    if !self.automaton.can_match(&state) {
+                        self.dead_at = Some(self.states.len() - 1);
+                        is_dead = true;
+                        break;
+                    }
+                }
+            }
+
+            let matches = !is_dead && self.automaton.is_match(&state);
             if matches {
                 self.always_match_at = self
                     .states
@@ -420,6 +465,7 @@ where
                 return false;
             }
             if matches {
+                self.delta_reader.ensure_values_loaded().unwrap();
                 return true;
             }
             if !self.advance_delta_reader() {
@@ -621,6 +667,46 @@ mod tests {
         assert_eq!(term_streamer.term_ord(), 2);
         assert_eq!(term_streamer.value(), &2u64);
         assert!(!term_streamer.advance());
+    }
+
+    #[test]
+    fn test_sstable_automaton_dead_prefix_and_chunks() -> io::Result<()> {
+        let mut dict_builder = Dictionary::<MonotonicU64SSTable>::builder(Vec::new())?;
+        let mut keys: Vec<String> = (0u64..2000)
+            .map(|i| match i % 5 {
+                0 => format!("aaa_{i:05}_tion"),
+                1 => format!("bbb_{i:05}_nnec_x"),
+                2 => format!("ccc_{i:05}_other"),
+                3 => format!("ddd_{i:05}_tion"),
+                _ => format!("eee_{i:05}_tail"),
+            })
+            .collect();
+        keys.sort();
+        for (idx, key) in keys.iter().enumerate() {
+            dict_builder.insert(key.as_bytes(), &(idx as u64))?;
+        }
+        let buffer = dict_builder.finish()?;
+        let dict = Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(buffer))?;
+
+        for pattern in ["aaa_.*_tion", ".*nnec.*", ".*tion"] {
+            let regex = tantivy_fst::Regex::new(pattern).unwrap();
+            let mut expected = Vec::new();
+            let mut stream = dict.search(&regex).without_keys().into_stream()?;
+            while let Some(&val) = stream.next_without_key() {
+                expected.push(val);
+            }
+            assert!(!expected.is_empty());
+
+            // Verify chunked parallel scan matches sequential scan identically.
+            if let Some(chunks) = dict.automaton_block_chunks(&regex, 4, 1)? {
+                let mut chunked_vals = Vec::new();
+                for slices in chunks {
+                    chunked_vals.extend(dict.stream_values_from_slices(slices, &regex)?);
+                }
+                assert_eq!(chunked_vals, expected, "mismatch for pattern {pattern}");
+            }
+        }
+        Ok(())
     }
 
     // TODO add test for sparse search with a block of poison (starts with 0xffffffff) => such a

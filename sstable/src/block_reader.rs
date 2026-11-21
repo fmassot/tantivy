@@ -17,6 +17,8 @@ pub struct BlockReader {
     /// the ordinal of its first term; consecutive blocks merged into one slice stay
     /// contiguous, so counting within a slice remains correct.
     pending_first_ordinal: Option<u64>,
+    #[cfg(feature = "zstd-compression")]
+    decompressor: Option<Decompressor<'static>>,
 }
 
 impl BlockReader {
@@ -27,6 +29,8 @@ impl BlockReader {
             next_readers: Vec::new().into_iter(),
             offset: 0,
             pending_first_ordinal: None,
+            #[cfg(feature = "zstd-compression")]
+            decompressor: None,
         }
     }
 
@@ -43,6 +47,8 @@ impl BlockReader {
             next_readers,
             offset: 0,
             pending_first_ordinal: Some(first_ordinal),
+            #[cfg(feature = "zstd-compression")]
+            decompressor: None,
         }
     }
 
@@ -110,7 +116,12 @@ impl BlockReader {
                     let required_capacity =
                         Decompressor::upper_bound(&self.reader[..block_len]).unwrap_or(1024 * 1024);
                     self.buffer.reserve(required_capacity);
-                    Decompressor::new()?
+                    if self.decompressor.is_none() {
+                        self.decompressor = Some(Decompressor::new()?);
+                    }
+                    self.decompressor
+                        .as_mut()
+                        .unwrap()
                         .decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
 
                     self.reader.advance(block_len);

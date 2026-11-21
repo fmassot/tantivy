@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use downcast_rs::{impl_downcast, DowncastSync};
+
 use super::Scorer;
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
@@ -65,7 +67,7 @@ pub(crate) fn for_each_pruning_scorer<TScorer: Scorer + ?Sized>(
 /// for a given set of segments.
 ///
 /// See [`Query`](crate::query::Query).
-pub trait Weight: Send + Sync + 'static {
+pub trait Weight: DowncastSync + Send + Sync + 'static {
     /// Returns the scorer for the given segment.
     ///
     /// `boost` is a multiplier to apply to the score.
@@ -163,3 +165,5 @@ pub trait Weight: Send + Sync + 'static {
         Ok(())
     }
 }
+
+impl_downcast!(sync Weight);

@@ -31,6 +31,23 @@ pub trait Postings: DocSet + 'static {
     fn positions(&mut self, output: &mut Vec<u32>) {
         self.positions_with_offset(0u32, output);
     }
+
+    /// Fast path when `self.term_freq() == 1` that returns the single offsetted position
+    /// without touching a `Vec<u32>`. Returns `None` if `term_freq() != 1` or positions are
+    /// unavailable.
+    #[inline]
+    fn single_position_with_offset(&mut self, offset: u32) -> Option<u32> {
+        if self.term_freq() != 1 {
+            return None;
+        }
+        let mut tmp = Vec::with_capacity(1);
+        self.append_positions_with_offset(offset, &mut tmp);
+        if tmp.len() == 1 {
+            Some(tmp[0])
+        } else {
+            None
+        }
+    }
 }
 
 impl Postings for Box<dyn Postings> {
@@ -40,5 +57,10 @@ impl Postings for Box<dyn Postings> {
 
     fn append_positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
         (**self).append_positions_with_offset(offset, output);
+    }
+
+    #[inline]
+    fn single_position_with_offset(&mut self, offset: u32) -> Option<u32> {
+        (**self).single_position_with_offset(offset)
     }
 }

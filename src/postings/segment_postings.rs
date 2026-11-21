@@ -17,6 +17,11 @@ pub struct SegmentPostings {
     pub(crate) block_cursor: BlockSegmentPostings,
     cur: usize,
     position_reader: Option<PositionReader>,
+    // Incremental prefix sum of `block_cursor.freqs()[..freq_prefix_sum_cur]` for the block
+    // identified by `freq_prefix_sum_block_pos` (`u64::MAX` when uninitialized).
+    freq_prefix_sum_block_pos: u64,
+    freq_prefix_sum_cur: usize,
+    freq_prefix_sum: u64,
 }
 
 impl SegmentPostings {
@@ -26,7 +31,31 @@ impl SegmentPostings {
             block_cursor: BlockSegmentPostings::empty(),
             cur: 0,
             position_reader: None,
+            freq_prefix_sum_block_pos: u64::MAX,
+            freq_prefix_sum_cur: 0,
+            freq_prefix_sum: 0,
         }
+    }
+
+    /// Computes the position stream offset for the current document using an incremental
+    /// prefix sum of frequencies within the loaded block.
+    #[inline]
+    fn position_read_offset(&mut self) -> u64 {
+        let block_pos = self.block_cursor.position_offset();
+        let freqs = self.block_cursor.freqs();
+        if self.freq_prefix_sum_block_pos == block_pos && self.cur >= self.freq_prefix_sum_cur {
+            if self.cur > self.freq_prefix_sum_cur {
+                let delta: u32 = freqs[self.freq_prefix_sum_cur..self.cur].iter().sum();
+                self.freq_prefix_sum += delta as u64;
+                self.freq_prefix_sum_cur = self.cur;
+            }
+        } else {
+            let sum: u32 = freqs[..self.cur].iter().sum();
+            self.freq_prefix_sum_block_pos = block_pos;
+            self.freq_prefix_sum_cur = self.cur;
+            self.freq_prefix_sum = sum as u64;
+        }
+        block_pos + self.freq_prefix_sum
     }
 
     /// Compute the number of non-deleted documents.
@@ -46,6 +75,20 @@ impl SegmentPostings {
             }
             docset.advance();
         }
+    }
+
+    /// Seeks to the first doc >= `target` even after a shallow `block_cursor.seek_block` call
+    /// that may have moved the skip reader ahead of the currently loaded block.
+    #[inline]
+    pub(crate) fn seek_after_shallow(&mut self, target: DocId) -> DocId {
+        if self.block_cursor.block_is_loaded() {
+            let current = self.doc();
+            if current >= target {
+                return current;
+            }
+        }
+        self.cur = self.block_cursor.seek(target);
+        self.doc()
     }
 
     /// Returns the overall number of documents in the block postings.
@@ -149,6 +192,9 @@ impl SegmentPostings {
             block_cursor: segment_block_postings,
             cur: 0, // cursor within the block
             position_reader,
+            freq_prefix_sum_block_pos: u64::MAX,
+            freq_prefix_sum_cur: 0,
+            freq_prefix_sum: 0,
         }
     }
 }
@@ -230,27 +276,47 @@ impl Postings for SegmentPostings {
     }
 
     fn append_positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
-        let term_freq = self.term_freq();
-        let prev_len = output.len();
-        if let Some(position_reader) = self.position_reader.as_mut() {
-            debug_assert!(
-                !self.block_cursor.freqs().is_empty(),
-                "No positions available"
-            );
-            let read_offset = self.block_cursor.position_offset()
-                + (self.block_cursor.freqs()[..self.cur]
-                    .iter()
-                    .cloned()
-                    .sum::<u32>() as u64);
-            // TODO: instead of zeroing the output, we could use MaybeUninit or similar.
-            output.resize(prev_len + term_freq as usize, 0u32);
-            position_reader.read(read_offset, &mut output[prev_len..]);
-            let mut cum = offset;
-            for output_mut in output[prev_len..].iter_mut() {
-                cum += *output_mut;
-                *output_mut = cum;
-            }
+        if self.position_reader.is_none() {
+            return;
         }
+        debug_assert!(
+            !self.block_cursor.freqs().is_empty(),
+            "No positions available"
+        );
+        let term_freq = self.term_freq();
+        let read_offset = self.position_read_offset();
+        let position_reader = self.position_reader.as_mut().unwrap();
+        if term_freq == 1 {
+            output.push(offset + position_reader.read_single(read_offset));
+            return;
+        }
+        let prev_len = output.len();
+        // TODO: instead of zeroing the output, we could use MaybeUninit or similar.
+        output.resize(prev_len + term_freq as usize, 0u32);
+        position_reader.read(read_offset, &mut output[prev_len..]);
+        let mut cum = offset;
+        for output_mut in output[prev_len..].iter_mut() {
+            cum += *output_mut;
+            *output_mut = cum;
+        }
+    }
+
+    #[inline]
+    fn single_position_with_offset(&mut self, offset: u32) -> Option<u32> {
+        if self.term_freq() != 1 || self.position_reader.is_none() {
+            return None;
+        }
+        debug_assert!(
+            !self.block_cursor.freqs().is_empty(),
+            "No positions available"
+        );
+        let read_offset = self.position_read_offset();
+        let pos = self
+            .position_reader
+            .as_mut()
+            .unwrap()
+            .read_single(read_offset);
+        Some(offset + pos)
     }
 }
 

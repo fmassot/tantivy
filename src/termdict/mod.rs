@@ -153,8 +153,34 @@ impl TermDictionary {
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
     pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> TermStreamerBuilder<'a, A>
-    where A::State: Clone {
+    where
+        A::State: Clone,
+    {
         self.0.search(automaton)
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn automaton_block_chunks(
+        &self,
+        automaton: &impl Automaton,
+        max_chunks: usize,
+        min_bytes_per_chunk: usize,
+    ) -> io::Result<Option<Vec<Vec<(common::OwnedBytes, u64)>>>> {
+        self.0
+            .automaton_block_chunks(automaton, max_chunks, min_bytes_per_chunk)
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn stream_values_from_slices<A>(
+        &self,
+        slices: Vec<(common::OwnedBytes, u64)>,
+        automaton: A,
+    ) -> io::Result<Vec<TermInfo>>
+    where
+        A: Automaton,
+        A::State: Clone,
+    {
+        self.0.stream_values_from_slices(slices, automaton)
     }
 
     #[cfg(feature = "quickwit")]

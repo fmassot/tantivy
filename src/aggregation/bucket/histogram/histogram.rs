@@ -266,7 +266,9 @@ impl HistogramBounds {
 }
 
 fn deserialize_date_or_num<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where D: serde::Deserializer<'de> {
+where
+    D: serde::Deserializer<'de>,
+{
     let value: serde_json::Value = Deserialize::deserialize(deserializer)?;
 
     // Check if the value is a string representing an Rfc3339 formatted date
@@ -481,12 +483,23 @@ impl<B: BucketIdSlot> HistogramBuckets<B> {
     }
 
     /// Consumes the storage, yielding all non-empty bucket entries.
-    fn into_filled_entries(self) -> Vec<SegmentHistogramBucketEntry<B>> {
+    fn into_filled_entries(
+        self,
+        interval: f64,
+        offset: f64,
+    ) -> Vec<SegmentHistogramBucketEntry<B>> {
         match self {
             HistogramBuckets::Sparse(map) => map.into_values().collect(),
-            HistogramBuckets::Dense { buckets, .. } => {
-                buckets.into_iter().filter(|b| b.doc_count > 0).collect()
-            }
+            HistogramBuckets::Dense { base_pos, buckets } => buckets
+                .into_iter()
+                .enumerate()
+                .filter(|(_, bucket)| bucket.doc_count > 0)
+                .map(|(idx, mut bucket)| {
+                    bucket.key =
+                        get_bucket_key_from_pos((base_pos + idx as i64) as f64, interval, offset);
+                    bucket
+                })
+                .collect(),
         }
     }
 }
@@ -577,6 +590,111 @@ impl<B: BucketIdSlot, const SOURCE_CONTAINS_MULTIVALUES: bool> SegmentAggregatio
                     }
                 }
             }
+        } else if let HistogramBuckets::Dense { base_pos, buckets } = store {
+            let is_unbounded = bounds == HistogramBounds::UNBOUNDED;
+            let fast_int_interval = if is_unbounded
+                && offset == 0.0
+                && interval >= 1.0
+                && interval.fract() == 0.0
+                && interval <= (1u64 << 53) as f64
+                && matches!(
+                    self.column_type,
+                    ColumnType::DateTime | ColumnType::I64 | ColumnType::U64
+                ) {
+                Some(interval as u64)
+            } else {
+                None
+            };
+
+            if let Some(interval_u64) = fast_int_interval {
+                let divider = fastdivide::DividerU64::divide_by(interval_u64);
+                let num_buckets = buckets.len();
+                match self.column_type {
+                    ColumnType::DateTime | ColumnType::I64 => {
+                        let base_origin_opt = base_pos.checked_mul(interval_u64 as i64);
+                        if let Some(base_origin) = base_origin_opt {
+                            // Margin covering f64 ULP rounding across the entire i64 range
+                            // (ULP of i64::MAX in f64 is 2048). Values strictly inside the
+                            // safe interior of a bucket never round across a boundary.
+                            const SAFE_MARGIN: u64 = 2048;
+                            let use_margin = interval_u64 > SAFE_MARGIN * 2;
+                            for val in accessor.iter_vals() {
+                                let val_i64 = i64::from_u64(val);
+                                let idx = if use_margin && val_i64 >= base_origin {
+                                    let delta = val_i64.wrapping_sub(base_origin) as u64;
+                                    let quotient = divider.divide(delta);
+                                    let rem = delta - quotient.wrapping_mul(interval_u64);
+                                    if rem >= SAFE_MARGIN && rem < interval_u64 - SAFE_MARGIN {
+                                        quotient as usize
+                                    } else {
+                                        (get_bucket_pos(val_i64 as f64) - *base_pos) as usize
+                                    }
+                                } else {
+                                    (get_bucket_pos(val_i64 as f64) - *base_pos) as usize
+                                };
+                                debug_assert!(idx < num_buckets);
+                                buckets[idx].doc_count += 1;
+                            }
+                        } else {
+                            for val in accessor.iter_vals() {
+                                let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                                let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                                debug_assert!(idx < num_buckets);
+                                buckets[idx].doc_count += 1;
+                            }
+                        }
+                    }
+                    ColumnType::U64 => {
+                        let base_origin_opt = u64::try_from(*base_pos)
+                            .ok()
+                            .and_then(|bp| bp.checked_mul(interval_u64));
+                        if let Some(base_origin) = base_origin_opt {
+                            const SAFE_MARGIN: u64 = 4096;
+                            let use_margin = interval_u64 > SAFE_MARGIN * 2;
+                            for val in accessor.iter_vals() {
+                                let idx = if use_margin && val >= base_origin {
+                                    let delta = val - base_origin;
+                                    let quotient = divider.divide(delta);
+                                    let rem = delta - quotient.wrapping_mul(interval_u64);
+                                    if rem >= SAFE_MARGIN && rem < interval_u64 - SAFE_MARGIN {
+                                        quotient as usize
+                                    } else {
+                                        (get_bucket_pos(val as f64) - *base_pos) as usize
+                                    }
+                                } else {
+                                    (get_bucket_pos(val as f64) - *base_pos) as usize
+                                };
+                                debug_assert!(idx < num_buckets);
+                                buckets[idx].doc_count += 1;
+                            }
+                        } else {
+                            for val in accessor.iter_vals() {
+                                let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                                let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                                debug_assert!(idx < num_buckets);
+                                buckets[idx].doc_count += 1;
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            } else if is_unbounded {
+                for val in accessor.iter_vals() {
+                    let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                    let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                    debug_assert!(idx < buckets.len());
+                    buckets[idx].doc_count += 1;
+                }
+            } else {
+                for val in accessor.iter_vals() {
+                    let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                    if bounds.contains(val_f64) {
+                        let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                        debug_assert!(idx < buckets.len());
+                        buckets[idx].doc_count += 1;
+                    }
+                }
+            }
         } else {
             for val in accessor.iter_vals() {
                 let val = f64_from_fastfield_u64(val, self.column_type);
@@ -649,7 +767,8 @@ impl<B: BucketIdSlot, const SOURCE_CONTAINS_MULTIVALUES: bool>
         agg_data: &AggregationsSegmentCtx,
         histogram: HistogramBuckets<B>,
     ) -> crate::Result<IntermediateBucketResult> {
-        let filled = histogram.into_filled_entries();
+        let filled =
+            histogram.into_filled_entries(self.req_data.req.interval, self.req_data.offset);
         let mut buckets = Vec::with_capacity(filled.len());
 
         for bucket in filled {

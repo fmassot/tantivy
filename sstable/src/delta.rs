@@ -87,7 +87,8 @@ impl DeltaKeyComparator {
 }
 
 pub struct DeltaWriter<W, TValueWriter>
-where W: io::Write
+where
+    W: io::Write,
 {
     block: Vec<u8>,
     write: CountingWriter<BufWriter<W>>,
@@ -204,12 +205,15 @@ pub struct DeltaReader<TValueReader> {
     common_prefix_len: usize,
     suffix_range: Range<usize>,
     value_reader: TValueReader,
+    value_block_range: Range<usize>,
+    values_loaded: bool,
     block_reader: BlockReader,
     idx: usize,
 }
 
 impl<TValueReader> DeltaReader<TValueReader>
-where TValueReader: value::ValueReader
+where
+    TValueReader: value::ValueReader,
 {
     pub fn new(reader: OwnedBytes) -> Self {
         DeltaReader {
@@ -217,6 +221,8 @@ where TValueReader: value::ValueReader
             common_prefix_len: 0,
             suffix_range: 0..0,
             value_reader: TValueReader::default(),
+            value_block_range: 0..0,
+            values_loaded: true,
             block_reader: BlockReader::new(reader),
         }
     }
@@ -229,6 +235,8 @@ where TValueReader: value::ValueReader
             common_prefix_len: 0,
             suffix_range: 0..0,
             value_reader: TValueReader::default(),
+            value_block_range: 0..0,
+            values_loaded: true,
             block_reader: BlockReader::from_multiple_blocks(reader),
         }
     }
@@ -249,6 +257,7 @@ where TValueReader: value::ValueReader
         self.block_reader.deserialize_u64()
     }
 
+    #[inline(always)]
     fn read_keep_add(&mut self) -> Option<(usize, usize)> {
         let b = {
             let buf = &self.block_reader.buffer();
@@ -272,6 +281,7 @@ where TValueReader: value::ValueReader
         }
     }
 
+    #[inline(always)]
     fn read_delta_key(&mut self) -> bool {
         let Some((keep, add)) = self.read_keep_add() else {
             return false;
@@ -289,12 +299,56 @@ where TValueReader: value::ValueReader
                 return Ok(false);
             }
             let consumed_len = self.value_reader.load(self.block_reader.buffer())?;
+            self.value_block_range = 0..consumed_len;
+            self.values_loaded = true;
             self.block_reader.advance(consumed_len);
             self.idx = 0;
         } else {
             self.idx += 1;
         }
         Ok(self.read_delta_key())
+    }
+
+    /// Advances to the next key while deferring value-block decoding when the [`ValueReader`]
+    /// supports [`ValueReader::skip`]. Callers must call [`DeltaReader::ensure_values_loaded`]
+    /// before reading [`DeltaReader::value`].
+    #[inline(always)]
+    pub fn advance_lazy(&mut self) -> io::Result<bool> {
+        if self.block_reader.buffer().is_empty() {
+            if !self.block_reader.read_block()? {
+                return Ok(false);
+            }
+            let start_offset = self.block_reader.offset();
+            if let Some(skip_res) = self.value_reader.skip(self.block_reader.buffer()) {
+                let consumed_len = skip_res?;
+                self.value_block_range = start_offset..(start_offset + consumed_len);
+                self.values_loaded = false;
+                self.block_reader.advance(consumed_len);
+            } else {
+                let consumed_len = self.value_reader.load(self.block_reader.buffer())?;
+                self.value_block_range = start_offset..(start_offset + consumed_len);
+                self.values_loaded = true;
+                self.block_reader.advance(consumed_len);
+            }
+            self.idx = 0;
+        } else {
+            self.idx += 1;
+        }
+        Ok(self.read_delta_key())
+    }
+
+    /// Decodes the current block's values if [`DeltaReader::advance_lazy`] deferred them.
+    #[inline(always)]
+    pub fn ensure_values_loaded(&mut self) -> io::Result<()> {
+        if !self.values_loaded {
+            let value_bytes = self
+                .block_reader
+                .buffer_from_to(self.value_block_range.clone());
+            let consumed_len = self.value_reader.load(value_bytes)?;
+            debug_assert_eq!(consumed_len, self.value_block_range.len());
+            self.values_loaded = true;
+        }
+        Ok(())
     }
 
     #[inline(always)]
