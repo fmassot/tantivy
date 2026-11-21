@@ -131,11 +131,20 @@ impl CardinalityAggregationReq {
 }
 
 #[derive(Clone, Debug)]
+enum CardinalityState {
+    Sketch(HllSketch),
+    /// Lazily promoted on the first `merge_fruits` call so multi-segment / multi-split merges
+    /// accumulate directly into a single `HllUnion` instead of allocating a fresh `HllUnion` and
+    /// copying the full sketch on every merge step.
+    Union(HllUnion),
+}
+
 /// The cardinality collector used during segment collection and for merging results.
-/// Uses Apache DataSketches HLL (lg_k=11, Hll4) for compact binary serialization
+/// Uses Apache DataSketches HLL (lg_k=11, Hll8) for compact binary serialization
 /// and cross-language compatibility (e.g. Java `datasketches` library).
+#[derive(Clone, Debug)]
 pub struct CardinalityCollector {
-    sketch: HllSketch,
+    state: CardinalityState,
     /// Salt derived from `ColumnType`, used to differentiate values of different column types
     /// that map to the same u64 (e.g. bool `false` = 0 vs i64 `0`).
     /// Not serialized — only needed during insertion, not after sketch registers are populated.
@@ -156,7 +165,7 @@ impl PartialEq for CardinalityCollector {
 
 impl Serialize for CardinalityCollector {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let bytes = self.sketch.serialize();
+        let bytes = self.to_sketch_bytes();
         serializer.serialize_bytes(&bytes)
     }
 }
@@ -165,15 +174,19 @@ impl<'de> Deserialize<'de> for CardinalityCollector {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
         let sketch = HllSketch::deserialize(&bytes).map_err(serde::de::Error::custom)?;
-        Ok(Self { sketch, salt: 0 })
+        Ok(Self {
+            state: CardinalityState::Sketch(sketch),
+            salt: 0,
+        })
     }
 }
 
 impl CardinalityCollector {
     fn new(salt: u8) -> Self {
         Self {
-            sketch: HllSketch::new(LG_K, HllType::Hll8)
-                .expect("LG_K is within the supported range"),
+            state: CardinalityState::Sketch(
+                HllSketch::new(LG_K, HllType::Hll8).expect("LG_K is within the supported range"),
+            ),
             salt,
         }
     }
@@ -181,30 +194,66 @@ impl CardinalityCollector {
     /// Insert a value into the HLL sketch, salted by the column type.
     /// The salt ensures that identical u64 values from different column types
     /// (e.g. bool `false` vs i64 `0`) are counted as distinct.
+    #[inline]
     fn insert(&mut self, value: impl Hash) {
-        self.sketch.update((self.salt, value));
+        match &mut self.state {
+            CardinalityState::Sketch(sketch) => sketch.update((self.salt, value)),
+            CardinalityState::Union(union) => union.update_value((self.salt, value)),
+        }
     }
 
+    #[inline]
     fn insert_coupon(&mut self, coupon: Coupon) {
-        self.sketch.update_with_coupon(coupon);
+        match &mut self.state {
+            CardinalityState::Sketch(sketch) => sketch.update_with_coupon(coupon),
+            CardinalityState::Union(union) => {
+                let mut sketch = union.to_sketch(HllType::Hll8);
+                sketch.update_with_coupon(coupon);
+                self.state = CardinalityState::Sketch(sketch);
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn estimate(&self) -> f64 {
+        match &self.state {
+            CardinalityState::Sketch(sketch) => sketch.estimate(),
+            CardinalityState::Union(union) => union.estimate(),
+        }
     }
 
     /// Compute the final cardinality estimate.
     pub fn finalize(self) -> Option<f64> {
-        Some(self.sketch.estimate().trunc())
+        Some(self.estimate().trunc())
     }
 
     /// Serialize the HLL sketch to its compact binary representation.
     /// The format is cross-language compatible with Apache DataSketches (Java, C++, Python).
     pub fn to_sketch_bytes(&self) -> Vec<u8> {
-        self.sketch.serialize()
+        match &self.state {
+            CardinalityState::Sketch(sketch) => sketch.serialize(),
+            CardinalityState::Union(union) => union.to_sketch(HllType::Hll8).serialize(),
+        }
     }
 
     pub(crate) fn merge_fruits(&mut self, right: CardinalityCollector) -> crate::Result<()> {
-        let mut union = HllUnion::new(LG_K).expect("LG_K is within the supported range");
-        union.update(&self.sketch);
-        union.update(&right.sketch);
-        self.sketch = union.to_sketch(HllType::Hll8);
+        if let CardinalityState::Sketch(left_sketch) = &self.state {
+            let mut union = HllUnion::new(LG_K).expect("LG_K is within the supported range");
+            union.update(left_sketch);
+            self.state = CardinalityState::Union(union);
+        }
+        let CardinalityState::Union(union) = &mut self.state else {
+            unreachable!("state was just ensured to be Union");
+        };
+        match right.state {
+            CardinalityState::Sketch(right_sketch) => {
+                union.update(&right_sketch);
+            }
+            CardinalityState::Union(right_union) => {
+                let right_sketch = right_union.to_sketch(HllType::Hll8);
+                union.update(&right_sketch);
+            }
+        }
         Ok(())
     }
 }

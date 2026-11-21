@@ -120,7 +120,7 @@ impl BucketSketch {
         match self {
             BucketSketch::Empty => Some(0.0),
             BucketSketch::Inline { len, .. } => Some(*len as f64),
-            BucketSketch::Sketch { collector, .. } => Some(collector.sketch.estimate().trunc()),
+            BucketSketch::Sketch { collector, .. } => Some(collector.estimate().trunc()),
             BucketSketch::Finalized => None,
         }
     }

@@ -484,6 +484,7 @@ pub(crate) fn build_segment_term_collector(
                     bucket_id_provider,
                     max_term_id: max_column_val,
                     terms_req_data,
+                    batched_str_resolution: None,
                 }));
             }
             return Ok(Box::new(SegmentTermCollector::<_, LowCardSubAggBuffer> {
@@ -492,6 +493,7 @@ pub(crate) fn build_segment_term_collector(
                 bucket_id_provider,
                 max_term_id: max_column_val,
                 terms_req_data,
+                batched_str_resolution: None,
             }));
         }
 
@@ -670,6 +672,7 @@ fn boxed_high_card_collector<M: TermAggregationMap>(
         bucket_id_provider,
         max_term_id,
         terms_req_data,
+        batched_str_resolution: None,
     })
 }
 
@@ -1188,6 +1191,32 @@ impl<B: BucketIdSlot> TermAggregationMap for LazyVecTermBuckets<B> {
     }
 }
 
+#[derive(Debug)]
+struct PrePrunedBucket<Slot: BucketIdSlot> {
+    entries: Vec<(u64, Bucket<Slot>)>,
+    term_doc_count_before_cutoff: u64,
+    sum_other_doc_count: u64,
+}
+
+impl<Slot: BucketIdSlot> Default for PrePrunedBucket<Slot> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            term_doc_count_before_cutoff: 0,
+            sum_other_doc_count: 0,
+        }
+    }
+}
+
+/// Pre-pruned parent buckets paired with a single-pass `term_ord -> String` map so nested
+/// `ColumnType::Str` terms aggregations scan the SSTable dictionary once across all parent
+/// buckets instead of decompressing the same dictionary blocks once per parent bucket.
+#[derive(Debug)]
+struct BatchedStrResolution<Slot: BucketIdSlot> {
+    per_parent: Vec<PrePrunedBucket<Slot>>,
+    resolved_terms: FxHashMap<u64, String>,
+}
+
 /// The collector puts values from the fast field into the correct buckets and does a conversion to
 /// the correct datatype.
 #[derive(Debug)]
@@ -1198,6 +1227,7 @@ struct SegmentTermCollector<TermMap: TermAggregationMap, B: SubAggBuffer> {
     bucket_id_provider: BucketIdProvider,
     max_term_id: u64,
     terms_req_data: TermsAggReqData,
+    batched_str_resolution: Option<BatchedStrResolution<TermMap::Slot>>,
 }
 
 pub(crate) fn get_agg_name_and_property(name: &str) -> (&str, &str) {
@@ -1214,6 +1244,125 @@ impl<TermMap: TermAggregationMap, B: SubAggBuffer> SegmentAggregationCollector
         results: &mut IntermediateAggregationResults,
         bucket: BucketId,
     ) -> crate::Result<()> {
+        // For nested `Str` terms aggs with 2..=256 parent buckets ordered by `_count` or `_key`,
+        // pre-prune all parent buckets and resolve their deduplicated winning ordinals in one
+        // sequential dictionary pass instead of decompressing SSTable blocks once per parent.
+        if self.batched_str_resolution.is_none()
+            && self.parent_buckets.len() > 1
+            && self.parent_buckets.len() <= 256
+            && self.terms_req_data.accessor.column_type() == ColumnType::Str
+            && matches!(
+                self.terms_req_data.req.order.target,
+                OrderTarget::Count | OrderTarget::Key
+            )
+        {
+            if let Some(term_dict) = self.terms_req_data.accessor.term_dictionary() {
+                let raw_parents = std::mem::take(&mut self.parent_buckets);
+                let mut per_parent = Vec::with_capacity(raw_parents.len());
+                let mut all_ords: Vec<u64> = Vec::new();
+                let missing_sentinel = self.terms_req_data.missing_value_for_accessor;
+
+                for parent_map in raw_parents {
+                    let mut entries = parent_map.into_vec();
+                    let (term_doc_count_before_cutoff, sum_other_doc_count) =
+                        select_and_cut_off_count_or_key(
+                            &mut entries,
+                            &self.terms_req_data,
+                            TermMap::SORTED_BY_KEY,
+                        );
+                    for &(ord, _) in &entries {
+                        if Some(ord) != missing_sentinel {
+                            all_ords.push(ord);
+                        }
+                    }
+                    per_parent.push(PrePrunedBucket {
+                        entries,
+                        term_doc_count_before_cutoff,
+                        sum_other_doc_count,
+                    });
+                }
+
+                all_ords.sort_unstable();
+                all_ords.dedup();
+                let mut resolved_terms =
+                    FxHashMap::with_capacity_and_hasher(all_ords.len(), Default::default());
+                let mut ord_iter = all_ords.iter().copied();
+                term_dict.sorted_ords_to_term_cb(&all_ords, &mut |term| {
+                    let ord = ord_iter.next().unwrap();
+                    resolved_terms.insert(
+                        ord,
+                        String::from_utf8(term.to_vec()).expect("could not convert to String"),
+                    );
+                })?;
+
+                self.batched_str_resolution = Some(BatchedStrResolution {
+                    per_parent,
+                    resolved_terms,
+                });
+            }
+        }
+
+        if let Some(batched) = &mut self.batched_str_resolution {
+            let pre_pruned = batched
+                .per_parent
+                .get_mut(bucket as usize)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            let term_req = &self.terms_req_data;
+            let name = term_req.name.clone();
+            let mut sub_agg_collector = self
+                .sub_agg
+                .as_mut()
+                .map(BufferedSubAggs::get_sub_agg_collector);
+            let mut entries = pre_pruned.entries;
+            let mut intermediate_entry_map: FxHashMap<
+                IntermediateKey,
+                IntermediateTermBucketEntry,
+            > = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+
+            if let Some((intermediate_key, missing_bucket)) =
+                extract_missing_value(&mut entries, term_req)
+            {
+                let intermediate_entry = into_intermediate_bucket_entry(
+                    missing_bucket,
+                    reborrow_opt_collector(&mut sub_agg_collector),
+                    agg_data,
+                )?;
+                intermediate_entry_map.insert(intermediate_key, intermediate_entry);
+            }
+
+            for (ord, entry_bucket) in entries {
+                let intermediate_entry = into_intermediate_bucket_entry(
+                    entry_bucket,
+                    reborrow_opt_collector(&mut sub_agg_collector),
+                    agg_data,
+                )?;
+                if let Some(term_str) = batched.resolved_terms.get(&ord) {
+                    intermediate_entry_map
+                        .insert(IntermediateKey::Str(term_str.clone()), intermediate_entry);
+                }
+            }
+
+            if term_req.req.min_doc_count == 0 {
+                if let Some(str_column) = term_req.accessor.as_physical_str_column() {
+                    fill_zero_doc_count_terms(str_column, term_req, &mut intermediate_entry_map)?;
+                }
+            }
+
+            let out: Vec<(IntermediateKey, IntermediateTermBucketEntry)> =
+                intermediate_entry_map.into_iter().collect();
+            let bucket_res = IntermediateBucketResult::Terms {
+                buckets: IntermediateTermBucketResult {
+                    entries: out,
+                    sum_other_doc_count: pre_pruned.sum_other_doc_count,
+                    doc_count_error_upper_bound: pre_pruned.term_doc_count_before_cutoff,
+                    ..Default::default()
+                },
+            };
+            results.push(name, IntermediateAggregationResult::Bucket(bucket_res))?;
+            return Ok(());
+        }
+
         // TODO: avoid prepare_max_bucket here and handle empty buckets.
         self.prepare_max_bucket(bucket, agg_data)?;
         let bucket = std::mem::replace(
