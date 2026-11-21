@@ -3,7 +3,7 @@ use std::ops::RangeInclusive;
 
 use columnar::Column;
 
-use crate::docset::SeekDangerResult;
+use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::{DocId, DocSet, TERMINATED};
 
 /// Helper to have a cursor over a vec of docids
@@ -97,6 +97,7 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
             return;
         }
         const MAX_HORIZON: u32 = 100_000;
+        const MAX_SEQUENTIAL_HORIZON: u32 = 4_096;
         while self.loaded_docs.is_empty() {
             let finished_to_end = self.fetch_horizon(self.fetch_horizon);
             if finished_to_end {
@@ -104,6 +105,11 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
             }
             // Fetch more data, increase horizon. Horizon only gets reset when doing a seek.
             self.fetch_horizon = (self.fetch_horizon * 2).min(MAX_HORIZON);
+        }
+        // Ramp horizon across consecutive sequential scans even when batches are non-empty,
+        // so dense range scans do not stay stuck at DEFAULT_FETCH_HORIZON (128).
+        if self.fetch_horizon < MAX_SEQUENTIAL_HORIZON {
+            self.fetch_horizon = (self.fetch_horizon * 2).min(MAX_SEQUENTIAL_HORIZON);
         }
     }
 
@@ -158,6 +164,32 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
     #[inline]
     fn doc(&self) -> DocId {
         self.loaded_docs.current().unwrap_or(TERMINATED)
+    }
+
+    #[inline]
+    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
+        if self.loaded_docs.is_empty() {
+            return 0;
+        }
+        let mut filled = 0usize;
+        while filled < COLLECT_BLOCK_BUFFER_LEN {
+            let remaining = &self.loaded_docs.docs[self.loaded_docs.current_pos..];
+            if remaining.is_empty() {
+                self.fetch_block();
+                if self.loaded_docs.is_empty() {
+                    return filled;
+                }
+                continue;
+            }
+            let take = remaining.len().min(COLLECT_BLOCK_BUFFER_LEN - filled);
+            buffer[filled..filled + take].copy_from_slice(&remaining[..take]);
+            self.loaded_docs.current_pos += take;
+            filled += take;
+        }
+        if self.loaded_docs.is_empty() {
+            self.fetch_block();
+        }
+        filled
     }
 
     /// Advances the `DocSet` forward until reaching the target, or going to the

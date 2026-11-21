@@ -654,6 +654,7 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
 
         let first_block = (doc_id_range.start / BLOCK_SIZE) as usize;
         let last_block = ((clamped_end - 1) / BLOCK_SIZE) as usize;
+        let mut block_positions: Vec<u32> = Vec::new();
 
         for block_id in first_block..=last_block {
             let block = &self.blocks[block_id];
@@ -674,13 +675,19 @@ impl ColumnValues for BlockwiseRleBitpackedReader {
 
             if block.num_runs == BLOCK_SIZE as u16 {
                 let run_data = &self.data[block.data_start_offset..];
-                for in_block in in_block_req_start..in_block_req_end {
-                    let norm_val =
-                        block.min_val + block.bit_unpacker.get(in_block as u32, run_data);
-                    if norm_val >= norm_start && norm_val <= norm_end {
-                        positions.push(block_doc_start + in_block as u32);
-                    }
-                }
+                let block_norm_start = norm_start.saturating_sub(block.min_val);
+                let block_norm_end = norm_end - block.min_val;
+                block.bit_unpacker.get_ids_for_value_range(
+                    block_norm_start..=block_norm_end,
+                    in_block_req_start as u32..in_block_req_end as u32,
+                    run_data,
+                    &mut block_positions,
+                );
+                positions.extend(
+                    block_positions
+                        .iter()
+                        .map(|&in_block| block_doc_start + in_block),
+                );
             } else {
                 let bitmap =
                     &self.data[block.data_start_offset..block.data_start_offset + BITMAP_BYTES];
