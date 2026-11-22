@@ -83,6 +83,32 @@ impl ArenaHashMap {
         self.shared_arena_hashmap
             .mutate_or_create(key, &mut self.memory_arena, updater);
     }
+
+    /// Same as [`Self::mutate_or_create`], returning the stable value [`Addr`] for direct updates
+    /// via [`Self::mutate_at`].
+    #[inline]
+    pub fn mutate_or_create_with_addr<V>(
+        &mut self,
+        key: &[u8],
+        updater: impl FnMut(Option<V>) -> V,
+    ) -> Addr
+    where
+        V: Copy + 'static,
+    {
+        self.shared_arena_hashmap
+            .mutate_or_create_with_addr(key, &mut self.memory_arena, updater)
+            .1
+    }
+
+    /// Mutates a value directly at a stable [`Addr`] previously returned by
+    /// [`Self::mutate_or_create_with_addr`], bypassing key hashing and table probing.
+    #[inline]
+    pub fn mutate_at<V>(&mut self, val_addr: Addr, updater: impl FnOnce(V) -> V)
+    where V: Copy + 'static {
+        let prev_val = self.memory_arena.read(val_addr);
+        let new_val = updater(prev_val);
+        self.memory_arena.write_at(val_addr, new_val);
+    }
 }
 
 #[cfg(test)]

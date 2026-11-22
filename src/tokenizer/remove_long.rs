@@ -50,7 +50,7 @@ impl TokenFilter for RemoveLongFilter {
 
 #[derive(Clone)]
 pub struct RemoveLongFilterWrapper<T: Tokenizer> {
-    length_limit: usize,
+    pub(crate) length_limit: usize,
     inner: T,
 }
 

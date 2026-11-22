@@ -1,7 +1,7 @@
 use std::io;
 
 use sstable::SSTable;
-use stacker::{MemoryArena, SharedArenaHashMap};
+use stacker::{Addr, MemoryArena, SharedArenaHashMap};
 
 pub(crate) struct TermIdMapping {
     unordered_to_ord: Vec<OrderedId>,
@@ -29,26 +29,67 @@ pub struct OrderedId(pub u32);
 ///
 /// Upon serialization, we will sort the ids and hence build a `UnorderedId -> Term ordinal`
 /// mapping.
-#[derive(Default)]
 pub(crate) struct DictionaryBuilder {
     dict: SharedArenaHashMap,
+    /// Cached ID for the empty term `b""` (extremely common in sparse/wide string columns).
+    empty_term_id: Option<UnorderedId>,
+    /// 1-entry cache for consecutive identical non-empty terms: stores the arena address of the
+    /// key bytes, its byte length, and its assigned `UnorderedId`.
+    last_term_key_addr: Addr,
+    last_term_len: u32,
+    last_term_id: UnorderedId,
+}
+
+impl Default for DictionaryBuilder {
+    fn default() -> Self {
+        Self {
+            dict: SharedArenaHashMap::default(),
+            empty_term_id: None,
+            last_term_key_addr: Addr::null_pointer(),
+            last_term_len: 0,
+            last_term_id: UnorderedId(0),
+        }
+    }
 }
 
 impl DictionaryBuilder {
     /// Get or allocate an unordered id.
     /// (This ID is simply an auto-incremented id.)
+    #[inline]
     pub fn get_or_allocate_id(&mut self, term: &[u8], arena: &mut MemoryArena) -> UnorderedId {
+        if term.is_empty() {
+            if let Some(id) = self.empty_term_id {
+                return id;
+            }
+            let next_id = self.dict.len() as u32;
+            let unordered_id = self
+                .dict
+                .mutate_or_create(term, arena, |id_opt: Option<u32>| id_opt.unwrap_or(next_id));
+            let id = UnorderedId(unordered_id);
+            self.empty_term_id = Some(id);
+            return id;
+        }
+        if !self.last_term_key_addr.is_null()
+            && self.last_term_len as usize == term.len()
+            && arena.slice(self.last_term_key_addr, term.len()) == term
+        {
+            return self.last_term_id;
+        }
         let next_id = self.dict.len() as u32;
-        let unordered_id = self
-            .dict
-            .mutate_or_create(term, arena, |unordered_id: Option<u32>| {
-                if let Some(unordered_id) = unordered_id {
-                    unordered_id
-                } else {
-                    next_id
-                }
-            });
-        UnorderedId(unordered_id)
+        let (unordered_id, val_addr) =
+            self.dict
+                .mutate_or_create_with_addr(term, arena, |id_opt: Option<u32>| {
+                    id_opt.unwrap_or(next_id)
+                });
+        let id = UnorderedId(unordered_id);
+        // `SharedArenaHashMap` truncates keys > `u16::MAX` and stores `[u16 len][key bytes][val]`
+        // contiguously inside one arena page, so `val_addr - key_len` points to the stored key.
+        if term.len() <= u16::MAX as usize {
+            self.last_term_key_addr = val_addr.offset((term.len() as u32).wrapping_neg());
+            self.last_term_len = term.len() as u32;
+            self.last_term_id = id;
+        }
+        id
     }
 
     fn build_sorted_terms<'a>(&'a self, arena: &'a MemoryArena) -> Vec<(&'a [u8], UnorderedId)> {

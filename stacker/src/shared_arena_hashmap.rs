@@ -301,8 +301,27 @@ impl SharedArenaHashMap {
         &mut self,
         key: &[u8],
         memory_arena: &mut MemoryArena,
-        mut updater: impl FnMut(Option<V>) -> V,
+        updater: impl FnMut(Option<V>) -> V,
     ) -> V
+    where
+        V: Copy + 'static,
+    {
+        self.mutate_or_create_with_addr(key, memory_arena, updater)
+            .0
+    }
+
+    /// Same as [`Self::mutate_or_create`], additionally returning the stable arena [`Addr`] of the
+    /// stored value `V`.
+    ///
+    /// Contract: because [`MemoryArena`] is append-only, the returned `Addr` stays valid for the
+    /// lifetime of this map even across hash-table resizes.
+    #[inline]
+    pub fn mutate_or_create_with_addr<V>(
+        &mut self,
+        key: &[u8],
+        memory_arena: &mut MemoryArena,
+        mut updater: impl FnMut(Option<V>) -> V,
+    ) -> (V, Addr)
     where
         V: Copy + 'static,
     {
@@ -321,17 +340,17 @@ impl SharedArenaHashMap {
                 let val = updater(None);
                 let num_bytes = std::mem::size_of::<u16>() + key.len() + std::mem::size_of::<V>();
                 let key_addr = memory_arena.allocate_space(num_bytes);
+                let stop = 2 + key.len();
                 {
                     let data = memory_arena.slice_mut(key_addr, num_bytes);
                     let key_len_bytes: [u8; 2] = (key.len() as u16).to_le_bytes();
                     data[..2].copy_from_slice(&key_len_bytes);
-                    let stop = 2 + key.len();
                     fast_short_slice_copy(key, &mut data[2..stop]);
                     store(&mut data[stop..], val);
                 }
 
                 self.set_bucket(hash, key_addr, bucket);
-                return val;
+                return (val, key_addr.offset(stop as u32));
             }
             if kv.hash == hash
                 && let Some(val_addr) =
@@ -340,7 +359,7 @@ impl SharedArenaHashMap {
                 let v = memory_arena.read(val_addr);
                 let new_v = updater(Some(v));
                 memory_arena.write_at(val_addr, new_v);
-                return new_v;
+                return (new_v, val_addr);
             }
             // This allows fetching the next bucket before the loop jmp
             bucket = probe.next_probe();

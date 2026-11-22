@@ -33,7 +33,9 @@ use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::space_usage::{ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, TERMDICT};
 use crate::termdict::{TermMerger, TermOrdinal};
-use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
+use crate::tokenizer::{
+    FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer, MAX_TOKEN_LEN,
+};
 use crate::{DocId, InvertedIndexReader, TantivyError};
 
 /// Built-in segment plugin that stores and merges the inverted index.
@@ -135,6 +137,9 @@ pub struct InvertedIndexPluginWriter {
     schema: Schema,
     per_field_postings_writers: PerFieldPostingsWriter,
     per_field_text_analyzers: Vec<TextAnalyzer>,
+    /// When `Some(limit)`, the field's text analyzer is `RawTokenizer` (optionally wrapped in
+    /// `RemoveLongFilter::limit(limit)`), allowing zero-copy indexing without `Token` copying.
+    per_field_raw_limit: Vec<Option<usize>>,
     fieldnorms_writer: FieldNormsWriter,
     term_buffer: IndexingTerm,
     json_path_writer: JsonPathWriter,
@@ -173,6 +178,11 @@ impl InvertedIndexPluginWriter {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let per_field_raw_limit: Vec<Option<usize>> = per_field_text_analyzers
+            .iter()
+            .map(TextAnalyzer::raw_pass_through_limit)
+            .collect();
+
         let fieldnorm_path = segment.relative_path(SegmentComponent::FieldNorms);
         let fieldnorm_write = segment.index().directory().open_write(&fieldnorm_path)?;
 
@@ -180,6 +190,7 @@ impl InvertedIndexPluginWriter {
         Ok(InvertedIndexPluginWriter {
             per_field_postings_writers: PerFieldPostingsWriter::for_schema(&schema),
             per_field_text_analyzers,
+            per_field_raw_limit,
             fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
             term_buffer: IndexingTerm::with_capacity(16),
             json_path_writer: JsonPathWriter::default(),
@@ -266,13 +277,33 @@ impl InvertedIndexPluginWriter {
                     }
                 }
                 FieldType::Str(_) => {
+                    const POSITION_GAP: u32 = 1;
+                    let field_idx = field.field_id() as usize;
+                    let raw_limit_opt = self.per_field_raw_limit[field_idx];
                     let mut indexing_position = IndexingPosition::default();
                     for value in values {
                         let value = value.as_value();
 
+                        if let (Some(limit), Some(text)) = (raw_limit_opt, value.as_str()) {
+                            if text.len() >= limit {
+                                indexing_position.end_position += POSITION_GAP;
+                                continue;
+                            }
+                            if text.len() <= MAX_TOKEN_LEN {
+                                debug_assert!(term_buffer.is_empty());
+                                let end_of_path_idx = term_buffer.len_bytes();
+                                term_buffer.append_bytes(text.as_bytes());
+                                let start_position = indexing_position.end_position;
+                                postings_writer.subscribe(doc_id, start_position, term_buffer, ctx);
+                                indexing_position.end_position = start_position + 1 + POSITION_GAP;
+                                indexing_position.num_tokens += 1;
+                                term_buffer.truncate_value_bytes(end_of_path_idx);
+                                continue;
+                            }
+                        }
+
                         let mut token_stream = if let Some(text) = value.as_str() {
-                            let text_analyzer =
-                                &mut self.per_field_text_analyzers[field.field_id() as usize];
+                            let text_analyzer = &mut self.per_field_text_analyzers[field_idx];
                             text_analyzer.token_stream(text)
                         } else if let Some(tok_str) = value.into_pre_tokenized_text() {
                             BoxTokenStream::new(PreTokenizedStream::from(*tok_str.clone()))
