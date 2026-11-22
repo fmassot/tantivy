@@ -24,12 +24,17 @@ use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
     IntermediateKey, IntermediateTermBucketEntry, IntermediateTermBucketResult,
 };
-use crate::aggregation::segment_agg_result::{BucketIdProvider, SegmentAggregationCollector};
+use crate::aggregation::segment_agg_result::{
+    collect_multiple_fallback, is_strictly_increasing, BucketIdProvider,
+    SegmentAggregationCollector,
+};
 use crate::aggregation::{format_date, BucketId, Key, ValueSource};
 use crate::error::DataCorruption;
 use crate::TantivyError;
 
+mod deferred_sub_agg;
 mod flattened_term_histogram;
+mod nested_deferred_sub_agg;
 
 /// Contains all information required by the SegmentTermCollector to perform the
 /// terms aggregation on a segment.
@@ -414,15 +419,27 @@ pub(crate) fn build_segment_term_collector(
     // we can still use Vec.
     let is_top_level = terms_req_data.is_top_level;
 
-    // Let's see if we can use a vec to aggregate our data
-    // instead of a hashmap.
-    let col_max_value = terms_req_data
+    // Determine the key range [min_column_val, max_column_val] so signed integer columns
+    // (whose monotonic u64 encoding starts near 2^63) and offset numeric columns can use dense
+    // Vec or Paged storage via `ShiftedTermMap` whenever `key_span = max - min` is small enough.
+    let (col_min_value, col_max_value) = terms_req_data
         .accessor
         .as_physical_column()
-        .map(|col| col.max_value())
-        .unwrap_or(u64::MAX);
-    let max_column_val: u64 =
-        col_max_value.max(terms_req_data.missing_value_for_accessor.unwrap_or(0u64));
+        .map(|col| {
+            let min_val = col.min_value();
+            let max_val = col.max_value();
+            if min_val <= max_val {
+                (min_val, max_val)
+            } else {
+                (0, u64::MAX)
+            }
+        })
+        .unwrap_or((0, u64::MAX));
+    let (min_column_val, max_column_val) = match terms_req_data.missing_value_for_accessor {
+        Some(missing) => (col_min_value.min(missing), col_max_value.max(missing)),
+        None => (col_min_value, col_max_value),
+    };
+    let key_span: u64 = max_column_val.saturating_sub(min_column_val);
 
     // Flattened fast path: low-cardinality terms × a single `histogram`/`date_histogram` leaf over
     // full columns with a small enough bucket grid. Anything else falls through to the general
@@ -450,34 +467,38 @@ pub(crate) fn build_segment_term_collector(
     // aggregations it stores a real `BucketId` (to key the buffered sub-aggs), without them the
     // zero-sized `()`, which shrinks each bucket and turns id assignment into a no-op.
     //
-    // Only the dense Vec/Paged storages below (all gated to `max_column_val <
-    // MAX_NUM_TERMS_FOR_PAGED_MAP`) use
-    // `num_terms`. `saturating_add` guards the HashMap fallback, where `max_column_val` is a raw
-    // numeric column value that can reach `u64::MAX`; term ordinals never come close.
-    let num_terms = max_column_val.saturating_add(1);
+    // Only the dense Vec/Paged storages below (all gated to `key_span <
+    // MAX_NUM_TERMS_FOR_PAGED_MAP`) use `num_terms`.
+    let num_terms = key_span.saturating_add(1);
 
-    // Very low cardinality without sub aggregations: cycle writes through independent count lanes,
-    // avoiding a serial read/modify/write dependency when consecutive docs repeatedly hit the same
-    // few terms. With sub aggregations, the per-doc buffer push already breaks that dependency;
-    // lanes only add indexing and a wider bucket layout, so retain one scalar counter and bucket id
-    // per term while pairing it with the `LowCard` doc buffer.
-    if is_top_level && max_column_val < MAX_NUM_TERMS_FOR_LOWCARD_SUBAGG {
+    // Very low cardinality: use dense Vec with count lanes (without sub-aggs) or LowCard doc
+    // buffer (with sub-aggs).
+    if is_top_level && key_span < MAX_NUM_TERMS_FOR_LOWCARD_SUBAGG {
         if has_sub_aggregations {
             let term_buckets = VecTermBuckets::<BucketId>::new(num_terms, &mut bucket_id_provider);
             add_memory_consumption(&term_buckets, req_data)?;
-            let collector: SegmentTermCollector<_, LowCardSubAggBuffer> = SegmentTermCollector {
-                parent_buckets: vec![term_buckets],
+            if min_column_val == 0 {
+                return Ok(Box::new(SegmentTermCollector::<_, LowCardSubAggBuffer> {
+                    parent_buckets: vec![term_buckets],
+                    sub_agg: sub_agg_collector.map(LowCardBufferedSubAggs::new),
+                    bucket_id_provider,
+                    max_term_id: max_column_val,
+                    terms_req_data,
+                }));
+            }
+            return Ok(Box::new(SegmentTermCollector::<_, LowCardSubAggBuffer> {
+                parent_buckets: vec![ShiftedTermMap::with_offset(min_column_val, term_buckets)],
                 sub_agg: sub_agg_collector.map(LowCardBufferedSubAggs::new),
                 bucket_id_provider,
                 max_term_id: max_column_val,
                 terms_req_data,
-            };
-            return Ok(Box::new(collector));
+            }));
         }
 
         let term_buckets = VecTermBucketsWithLanes::<()>::new(num_terms, &mut bucket_id_provider);
         add_memory_consumption(&term_buckets, req_data)?;
-        return Ok(boxed_high_card_collector(
+        return Ok(boxed_high_card_maybe_shifted(
+            min_column_val,
             term_buckets,
             None,
             bucket_id_provider,
@@ -486,20 +507,80 @@ pub(crate) fn build_segment_term_collector(
         ));
     }
 
+    // Breadth-first two-pass path for terms aggregations with sub-aggregations when the order
+    // target does not depend on sub-aggregation values and the column's key span exceeds
+    // `segment_size`. Counting first and replaying only the top `segment_size` winners into
+    // sub-aggregations avoids allocating and populating sub-agg state for discarded buckets.
+    if has_sub_aggregations
+        && matches!(
+            terms_req_data.req.order.target,
+            OrderTarget::Count | OrderTarget::Key
+        )
+        && key_span >= MAX_NUM_TERMS_FOR_LOWCARD_SUBAGG
+        && key_span > terms_req_data.req.segment_size as u64
+    {
+        if let Some(sub_agg_collector) = sub_agg_collector {
+            if is_top_level {
+                if key_span < MAX_NUM_TERMS_FOR_VEC {
+                    let term_buckets =
+                        VecTermBuckets::<()>::new(num_terms, &mut bucket_id_provider);
+                    add_memory_consumption(&term_buckets, req_data)?;
+                    return Ok(boxed_deferred_maybe_shifted(
+                        min_column_val,
+                        term_buckets,
+                        sub_agg_collector,
+                        bucket_id_provider,
+                        min_column_val,
+                        max_column_val,
+                        terms_req_data,
+                    ));
+                } else if key_span < MAX_NUM_TERMS_FOR_PAGED_MAP {
+                    let term_buckets = PagedTermMap::<()>::new(num_terms, &mut bucket_id_provider);
+                    return Ok(boxed_deferred_maybe_shifted(
+                        min_column_val,
+                        term_buckets,
+                        sub_agg_collector,
+                        bucket_id_provider,
+                        min_column_val,
+                        max_column_val,
+                        terms_req_data,
+                    ));
+                } else {
+                    let term_buckets = HashMapTermBuckets::<()>::default();
+                    return Ok(Box::new(
+                        deferred_sub_agg::DeferredSubAggTermCollector::new(
+                            term_buckets,
+                            sub_agg_collector,
+                            bucket_id_provider,
+                            min_column_val,
+                            max_column_val,
+                            terms_req_data,
+                        ),
+                    ));
+                }
+            }
+            return Ok(Box::new(
+                nested_deferred_sub_agg::NestedDeferredSubAggTermCollector::new(
+                    sub_agg_collector,
+                    bucket_id_provider,
+                    terms_req_data,
+                ),
+            ));
+        }
+    }
+
     // Everything below uses the partitioned `HighCard` sub-agg buffer, so it is built once here.
     let sub_agg = sub_agg_collector.map(BufferedSubAggs::new);
-    if is_top_level && max_column_val < MAX_NUM_TERMS_FOR_VEC {
-        // Low/moderate cardinality: dense `Vec` storage, direct-indexed by term ordinal — no
+    if is_top_level && key_span < MAX_NUM_TERMS_FOR_VEC {
+        // Low/moderate cardinality: dense `Vec` storage, direct-indexed by shifted key — no
         // hashing or page indirection. Used both with and without sub aggregations.
         if has_sub_aggregations {
-            // Eager id assignment (branchless `term_entry`) while the bucket count is small;
-            // switch to lazy above the threshold to keep the sub-agg bucket range compact for
-            // large/sparse ordinal spaces. See `LAZY_BUCKET_ID_GENERATION_THRESHOLD`.
             if num_terms > LAZY_BUCKET_ID_GENERATION_THRESHOLD {
                 let term_buckets =
                     LazyVecTermBuckets::<BucketId>::new(num_terms, &mut bucket_id_provider);
                 add_memory_consumption(&term_buckets, req_data)?;
-                Ok(boxed_high_card_collector(
+                Ok(boxed_high_card_maybe_shifted(
+                    min_column_val,
                     term_buckets,
                     sub_agg,
                     bucket_id_provider,
@@ -510,7 +591,8 @@ pub(crate) fn build_segment_term_collector(
                 let term_buckets =
                     VecTermBuckets::<BucketId>::new(num_terms, &mut bucket_id_provider);
                 add_memory_consumption(&term_buckets, req_data)?;
-                Ok(boxed_high_card_collector(
+                Ok(boxed_high_card_maybe_shifted(
+                    min_column_val,
                     term_buckets,
                     sub_agg,
                     bucket_id_provider,
@@ -519,11 +601,10 @@ pub(crate) fn build_segment_term_collector(
                 ))
             }
         } else {
-            // No sub aggregations: the `()` slot carries no id, so eager vs lazy is moot and
-            // `term_entry` is branchless either way.
             let term_buckets = VecTermBuckets::<()>::new(num_terms, &mut bucket_id_provider);
             add_memory_consumption(&term_buckets, req_data)?;
-            Ok(boxed_high_card_collector(
+            Ok(boxed_high_card_maybe_shifted(
+                min_column_val,
                 term_buckets,
                 sub_agg,
                 bucket_id_provider,
@@ -531,10 +612,11 @@ pub(crate) fn build_segment_term_collector(
                 terms_req_data,
             ))
         }
-    } else if is_top_level && max_column_val < MAX_NUM_TERMS_FOR_PAGED_MAP {
+    } else if is_top_level && key_span < MAX_NUM_TERMS_FOR_PAGED_MAP {
         if has_sub_aggregations {
             let term_buckets = PagedTermMap::<BucketId>::new(num_terms, &mut bucket_id_provider);
-            Ok(boxed_high_card_collector(
+            Ok(boxed_high_card_maybe_shifted(
+                min_column_val,
                 term_buckets,
                 sub_agg,
                 bucket_id_provider,
@@ -543,7 +625,8 @@ pub(crate) fn build_segment_term_collector(
             ))
         } else {
             let term_buckets = PagedTermMap::<()>::new(num_terms, &mut bucket_id_provider);
-            Ok(boxed_high_card_collector(
+            Ok(boxed_high_card_maybe_shifted(
+                min_column_val,
                 term_buckets,
                 sub_agg,
                 bucket_id_provider,
@@ -588,6 +671,110 @@ fn boxed_high_card_collector<M: TermAggregationMap>(
         max_term_id,
         terms_req_data,
     })
+}
+
+fn boxed_high_card_maybe_shifted<M: TermAggregationMap>(
+    min_column_val: u64,
+    term_buckets: M,
+    sub_agg: Option<HighCardBufferedSubAggs>,
+    bucket_id_provider: BucketIdProvider,
+    max_term_id: u64,
+    terms_req_data: TermsAggReqData,
+) -> Box<dyn SegmentAggregationCollector> {
+    if min_column_val == 0 {
+        boxed_high_card_collector(
+            term_buckets,
+            sub_agg,
+            bucket_id_provider,
+            max_term_id,
+            terms_req_data,
+        )
+    } else {
+        boxed_high_card_collector(
+            ShiftedTermMap::with_offset(min_column_val, term_buckets),
+            sub_agg,
+            bucket_id_provider,
+            max_term_id,
+            terms_req_data,
+        )
+    }
+}
+
+fn boxed_deferred_maybe_shifted<M: TermAggregationMap<Slot = ()>>(
+    offset: u64,
+    term_buckets: M,
+    sub_agg_collector: Box<dyn SegmentAggregationCollector>,
+    bucket_id_provider: BucketIdProvider,
+    min_term_id: u64,
+    max_term_id: u64,
+    terms_req_data: TermsAggReqData,
+) -> Box<dyn SegmentAggregationCollector> {
+    if offset == 0 {
+        Box::new(deferred_sub_agg::DeferredSubAggTermCollector::new(
+            term_buckets,
+            sub_agg_collector,
+            bucket_id_provider,
+            min_term_id,
+            max_term_id,
+            terms_req_data,
+        ))
+    } else {
+        Box::new(deferred_sub_agg::DeferredSubAggTermCollector::new(
+            ShiftedTermMap::with_offset(offset, term_buckets),
+            sub_agg_collector,
+            bucket_id_provider,
+            min_term_id,
+            max_term_id,
+            terms_req_data,
+        ))
+    }
+}
+
+/// Zero-overhead adapter shifting keys by a constant `offset` so dense/paged maps can index
+/// signed integer (`i64`, offset near `2^63`) or non-zero-based numeric columns directly.
+#[derive(Clone, Debug)]
+struct ShiftedTermMap<M: TermAggregationMap> {
+    offset: u64,
+    inner: M,
+}
+
+impl<M: TermAggregationMap> ShiftedTermMap<M> {
+    #[inline]
+    fn with_offset(offset: u64, inner: M) -> Self {
+        Self { offset, inner }
+    }
+}
+
+impl<M: TermAggregationMap> TermAggregationMap for ShiftedTermMap<M> {
+    type Slot = M::Slot;
+
+    const SORTED_BY_KEY: bool = M::SORTED_BY_KEY;
+
+    fn new(map_init_value: u64, bucket_id_provider: &mut BucketIdProvider) -> Self {
+        Self {
+            offset: 0,
+            inner: M::new(map_init_value, bucket_id_provider),
+        }
+    }
+
+    #[inline]
+    fn get_memory_consumption(&self) -> usize {
+        self.inner.get_memory_consumption()
+    }
+
+    #[inline]
+    fn term_entry(&mut self, key: u64, bucket_id_provider: &mut BucketIdProvider) -> Self::Slot {
+        self.inner.term_entry(key - self.offset, bucket_id_provider)
+    }
+
+    fn into_vec(self) -> Vec<(u64, Bucket<Self::Slot>)> {
+        let offset = self.offset;
+        self.inner
+            .into_vec()
+            .into_iter()
+            .map(|(shifted_key, bucket)| (shifted_key + offset, bucket))
+            .collect()
+    }
 }
 
 /// A term bucket: its doc count plus a [`BucketIdSlot`] identifying it for sub-aggregations.
@@ -1112,6 +1299,116 @@ impl<TermMap: TermAggregationMap, B: SubAggBuffer> SegmentAggregationCollector
         Ok(())
     }
 
+    fn collect_multiple(
+        &mut self,
+        parent_bucket_ids: &[BucketId],
+        docs: &[crate::DocId],
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        debug_assert_eq!(parent_bucket_ids.len(), docs.len());
+        if docs.is_empty() {
+            return Ok(());
+        }
+        if !is_strictly_increasing(docs) {
+            return collect_multiple_fallback(self, parent_bucket_ids, docs, agg_data);
+        }
+
+        let req_data = &mut self.terms_req_data;
+        agg_data
+            .column_block_accessor
+            .fetch_block_with_missing_unique_per_doc(
+                docs,
+                &mut *req_data.accessor,
+                req_data.missing_value_for_accessor,
+                true,
+            );
+
+        let allowed_bs = req_data.allowed_term_ids.as_ref();
+        let vals = agg_data.column_block_accessor.values();
+        let mut mem_delta: usize = 0;
+
+        if agg_data.column_block_accessor.cardinality().is_full() {
+            if let Some(sub_agg) = &mut self.sub_agg {
+                for i in 0..docs.len() {
+                    let term_id = vals[i];
+                    if let Some(allowed) = allowed_bs {
+                        if !allowed.contains(term_id as u32) {
+                            continue;
+                        }
+                    }
+                    let term_buckets = &mut self.parent_buckets[parent_bucket_ids[i] as usize];
+                    let mem_pre = term_buckets.get_memory_consumption();
+                    let bucket_id = term_buckets.term_entry(term_id, &mut self.bucket_id_provider);
+                    mem_delta += term_buckets.get_memory_consumption() - mem_pre;
+                    sub_agg.push(bucket_id.to_bucket_id(), docs[i]);
+                }
+            } else {
+                for i in 0..docs.len() {
+                    let term_id = vals[i];
+                    if let Some(allowed) = allowed_bs {
+                        if !allowed.contains(term_id as u32) {
+                            continue;
+                        }
+                    }
+                    let term_buckets = &mut self.parent_buckets[parent_bucket_ids[i] as usize];
+                    let mem_pre = term_buckets.get_memory_consumption();
+                    term_buckets.term_entry(term_id, &mut self.bucket_id_provider);
+                    mem_delta += term_buckets.get_memory_consumption() - mem_pre;
+                }
+            }
+        } else {
+            let docids = agg_data.column_block_accessor.docids();
+            let mut doc_idx = 0usize;
+            if let Some(sub_agg) = &mut self.sub_agg {
+                for (&doc, &term_id) in docids.iter().zip(vals.iter()) {
+                    while docs[doc_idx] < doc {
+                        doc_idx += 1;
+                    }
+                    debug_assert_eq!(docs[doc_idx], doc);
+                    if let Some(allowed) = allowed_bs {
+                        if !allowed.contains(term_id as u32) {
+                            continue;
+                        }
+                    }
+                    let term_buckets =
+                        &mut self.parent_buckets[parent_bucket_ids[doc_idx] as usize];
+                    let mem_pre = term_buckets.get_memory_consumption();
+                    let bucket_id = term_buckets.term_entry(term_id, &mut self.bucket_id_provider);
+                    mem_delta += term_buckets.get_memory_consumption() - mem_pre;
+                    sub_agg.push(bucket_id.to_bucket_id(), doc);
+                }
+            } else {
+                for (&doc, &term_id) in docids.iter().zip(vals.iter()) {
+                    while docs[doc_idx] < doc {
+                        doc_idx += 1;
+                    }
+                    debug_assert_eq!(docs[doc_idx], doc);
+                    if let Some(allowed) = allowed_bs {
+                        if !allowed.contains(term_id as u32) {
+                            continue;
+                        }
+                    }
+                    let term_buckets =
+                        &mut self.parent_buckets[parent_bucket_ids[doc_idx] as usize];
+                    let mem_pre = term_buckets.get_memory_consumption();
+                    term_buckets.term_entry(term_id, &mut self.bucket_id_provider);
+                    mem_delta += term_buckets.get_memory_consumption() - mem_pre;
+                }
+            }
+        }
+
+        if mem_delta > 0 {
+            agg_data
+                .context
+                .limits
+                .add_memory_consumed(mem_delta as u64)?;
+        }
+        if let Some(sub_agg) = &mut self.sub_agg {
+            sub_agg.check_flush_local(agg_data)?;
+        }
+        Ok(())
+    }
+
     #[inline]
     fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
         if let Some(sub_agg) = &mut self.sub_agg {
@@ -1252,45 +1549,18 @@ where
     #[inline]
     pub(crate) fn into_intermediate_bucket_result(
         term_req: &TermsAggReqData,
-        mut sub_agg_collector: Option<&mut dyn SegmentAggregationCollector>,
+        sub_agg_collector: Option<&mut dyn SegmentAggregationCollector>,
         term_buckets: TermMap,
         agg_data: &AggregationsSegmentCtx,
     ) -> crate::Result<IntermediateBucketResult> {
         let mut entries: Vec<(u64, Bucket<TermMap::Slot>)> = term_buckets.into_vec();
 
-        let segment_size = term_req.req.segment_size as usize;
-
-        // Total doc count over all buckets, computed is some case, and which can be reused by
-        // `cut_off_buckets` to derive `sum_other_doc_count` without a second pass.
-        let mut total_doc_count: Option<u64> = None;
-
-        // select_nth_unstable_by_key(segment_size, ...) places the (k+1)-th element at
-        // entries[segment_size] and guarantees entries[0..segment_size] are the top-k,
-        // unordered. We need this to properly compute term_doc_count_before_cutoff.
-        // In some cases (already sorted entries), we are faster sorting everything and
-        // going through sort_unstable's fast path.
-        match &term_req.req.order.target {
-            OrderTarget::Key => {
-                // We rely on the fact, that term ordinals match the order of the strings
-                // TODO: We could have a special collector, that keeps only TOP n results at any
-                // time.
-                if TermMap::SORTED_BY_KEY {
-                    // `into_vec` already returned entries sorted by ord ascending, we can just
-                    // revert if we want descending.
-                    if term_req.req.order.order == Order::Desc {
-                        entries.reverse();
-                    }
-                } else if entries.len() > segment_size {
-                    // Unsorted source: use select_nth
-                    if term_req.req.order.order == Order::Desc {
-                        entries
-                            .select_nth_unstable_by_key(segment_size, |b| std::cmp::Reverse(b.0));
-                    } else {
-                        entries.select_nth_unstable_by_key(segment_size, |b| b.0);
-                    }
-                }
+        let (term_doc_count_before_cutoff, sum_other_doc_count) = match &term_req.req.order.target {
+            OrderTarget::Key | OrderTarget::Count => {
+                select_and_cut_off_count_or_key(&mut entries, term_req, TermMap::SORTED_BY_KEY)
             }
             OrderTarget::SubAggregation(sub_agg_path) => {
+                let segment_size = term_req.req.segment_size as usize;
                 // Peek segment-level metric values, select top-k, then fall through to
                 // `cut_off_buckets`. Like Elasticsearch, we always cut off when ordering
                 // by a sub-agg: top-K results are approximate and may differ from the
@@ -1333,14 +1603,56 @@ where
                     }
                 }
                 entries = keyed.into_iter().map(|(_, e)| e).collect();
+                cut_off_buckets(&mut entries, segment_size, None)
             }
-            OrderTarget::Count => {
-                if entries.len() > segment_size {
-                    // unique or near-unique fields create big runs of sorted values (ones),
-                    // which is defavorable to quickselect. use the then faster sort_unstable.
-                    let num_buckets = entries.len() as u64;
-                    let num_docs = entries.iter().map(|(_, b)| b.count as u64).sum();
-                    total_doc_count = Some(num_docs);
+        };
+
+        materialize_term_buckets(
+            term_req,
+            sub_agg_collector,
+            entries,
+            term_doc_count_before_cutoff,
+            sum_other_doc_count,
+            agg_data,
+        )
+    }
+}
+
+/// Orders (or selects) and truncates `entries` to `term_req.req.segment_size` for
+/// [`OrderTarget::Key`] and [`OrderTarget::Count`], returning
+/// `(term_doc_count_before_cutoff, sum_other_doc_count)`.
+pub(super) fn select_and_cut_off_count_or_key<B: BucketIdSlot>(
+    entries: &mut Vec<(u64, Bucket<B>)>,
+    term_req: &TermsAggReqData,
+    sorted_by_key: bool,
+) -> (u64, u64) {
+    let segment_size = term_req.req.segment_size as usize;
+    let mut total_doc_count: Option<u64> = None;
+
+    match &term_req.req.order.target {
+        OrderTarget::Key => {
+            if sorted_by_key {
+                if term_req.req.order.order == Order::Desc {
+                    entries.reverse();
+                }
+            } else if entries.len() > segment_size {
+                if term_req.req.order.order == Order::Desc {
+                    entries.select_nth_unstable_by_key(segment_size, |b| std::cmp::Reverse(b.0));
+                } else {
+                    entries.select_nth_unstable_by_key(segment_size, |b| b.0);
+                }
+            }
+        }
+        OrderTarget::Count => {
+            if entries.len() > segment_size {
+                // unique or near-unique fields create big runs of sorted values (ones),
+                // which is defavorable to quickselect. use the then faster sort_unstable.
+                let num_buckets = entries.len() as u64;
+                let num_docs = entries.iter().map(|(_, b)| b.count as u64).sum();
+                total_doc_count = Some(num_docs);
+                // When every bucket has count == 1 (e.g. unique IDs), all entries are already
+                // tied for top-`segment_size`, so skip sorting completely.
+                if num_docs > num_buckets {
                     let many_buckets_with_same_count =
                         num_docs < num_buckets * DOCS_PER_BUCKET_QUICKSELECT_THRESHOLD;
                     if term_req.req.order.order == Order::Desc {
@@ -1359,194 +1671,197 @@ where
                 }
             }
         }
+        OrderTarget::SubAggregation(_) => {
+            unreachable!("select_and_cut_off_count_or_key called for OrderTarget::SubAggregation")
+        }
+    }
 
-        let (term_doc_count_before_cutoff, sum_other_doc_count) =
-            cut_off_buckets(&mut entries, segment_size, total_doc_count);
+    cut_off_buckets(entries, segment_size, total_doc_count)
+}
 
-        // Collected entries, in unspecified order. The cross-segment merge keys entries by their
-        // own dictionary and the final result is sorted by the requested order, so segment-side
-        // order does not matter here.
-        let mut out: Vec<(IntermediateKey, IntermediateTermBucketEntry)> =
-            Vec::with_capacity(entries.len());
+/// Converts already-pruned `(raw_key, Bucket)` entries into an [`IntermediateBucketResult::Terms`].
+pub(super) fn materialize_term_buckets<B: BucketIdSlot>(
+    term_req: &TermsAggReqData,
+    mut sub_agg_collector: Option<&mut dyn SegmentAggregationCollector>,
+    mut entries: Vec<(u64, Bucket<B>)>,
+    term_doc_count_before_cutoff: u64,
+    sum_other_doc_count: u64,
+    agg_data: &AggregationsSegmentCtx,
+) -> crate::Result<IntermediateBucketResult> {
+    // Collected entries, in unspecified order. The cross-segment merge keys entries by their
+    // own dictionary and the final result is sorted by the requested order, so segment-side
+    // order does not matter here.
+    let mut out: Vec<(IntermediateKey, IntermediateTermBucketEntry)> =
+        Vec::with_capacity(entries.len());
 
-        let column_type = term_req.accessor.column_type();
-        if column_type == ColumnType::Str {
-            // `ValueSource::term_dictionary` guarantees a dictionary for every `Str` source.
-            let Some(term_dict) = term_req.accessor.term_dictionary() else {
-                return Err(crate::TantivyError::InternalError(
-                    "a `Str` value source must provide a term dictionary".to_string(),
-                ));
-            };
-
-            // Collect into a map to dedup by key, then flush into `out`. Two cases need it: a real
-            // term may equal the `missing` placeholder, and the min_doc_count==0 fill must skip
-            // already-collected terms. A single-segment query returns this result directly (the
-            // cross-segment merge that would otherwise dedup never runs), so duplicate keys here
-            // would reach the final result unmerged.
-            let mut intermediate_entry_map: FxHashMap<
-                IntermediateKey,
-                IntermediateTermBucketEntry,
-            > = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
-
-            if let Some((intermediate_key, bucket)) = extract_missing_value(&mut entries, term_req)
-            {
-                let intermediate_entry = into_intermediate_bucket_entry(
-                    bucket,
-                    reborrow_opt_collector(&mut sub_agg_collector),
-                    agg_data,
-                )?;
-                intermediate_entry_map.insert(intermediate_key, intermediate_entry);
-            }
-
-            // Sort by term ord
-            entries.sort_unstable_by_key(|bucket| bucket.0);
-
-            let (term_ids, buckets): (Vec<u64>, Vec<Bucket<TermMap::Slot>>) =
-                entries.into_iter().unzip();
-
-            let intermediate_entries: Vec<IntermediateTermBucketEntry> = buckets
-                .into_iter()
-                .map(|bucket| {
-                    into_intermediate_bucket_entry(
-                        bucket,
-                        reborrow_opt_collector(&mut sub_agg_collector),
-                        agg_data,
-                    )
-                })
-                .collect::<crate::Result<_>>()?;
-
-            let mut intermediate_entry_it = intermediate_entries.into_iter();
-
-            term_dict.sorted_ords_to_term_cb(&term_ids[..], &mut |term| {
-                let intermediate_entry = intermediate_entry_it.next().unwrap();
-                intermediate_entry_map.insert(
-                    IntermediateKey::Str(
-                        String::from_utf8(term.to_vec()).expect("could not convert to String"),
-                    ),
-                    intermediate_entry,
-                );
-            })?;
-
-            // If min_doc_count is 0, we need to complete the results with terms that are part of
-            // the dictionary, but not part of the search results.
-            if term_req.req.min_doc_count == 0 {
-                // That feature only works on physical str column (with a term dictionary)
-                if let Some(str_column) = term_req.accessor.as_physical_str_column() {
-                    fill_zero_doc_count_terms(str_column, term_req, &mut intermediate_entry_map)?;
-                }
-            }
-
-            out.extend(intermediate_entry_map);
-        } else if column_type == ColumnType::DateTime {
-            for (val, doc_count) in entries {
-                let intermediate_entry = into_intermediate_bucket_entry(
-                    doc_count,
-                    reborrow_opt_collector(&mut sub_agg_collector),
-                    agg_data,
-                )?;
-                let val = i64::from_u64(val);
-                let date = format_date(val)?;
-                out.push((IntermediateKey::Str(date), intermediate_entry));
-            }
-        } else if column_type == ColumnType::Bool {
-            for (val, doc_count) in entries {
-                let intermediate_entry = into_intermediate_bucket_entry(
-                    doc_count,
-                    reborrow_opt_collector(&mut sub_agg_collector),
-                    agg_data,
-                )?;
-                let val = bool::from_u64(val);
-                out.push((IntermediateKey::Bool(val), intermediate_entry));
-            }
-        } else if column_type == ColumnType::IpAddr {
-            let compact_space_accessor = term_req
-                .accessor
-                .as_physical_column()
-                .ok_or_else(|| {
-                    TantivyError::AggregationError(
-                        crate::aggregation::AggregationError::InternalError(
-                            "IpAddr term keys require a physical column".to_string(),
-                        ),
-                    )
-                })?
-                .values
-                .clone()
-                .downcast_arc::<CompactSpaceU64Accessor>()
-                .map_err(|_| {
-                    TantivyError::AggregationError(
-                        crate::aggregation::AggregationError::InternalError(
-                            "Type mismatch: Could not downcast to CompactSpaceU64Accessor"
-                                .to_string(),
-                        ),
-                    )
-                })?;
-
-            for (val, doc_count) in entries {
-                let intermediate_entry = into_intermediate_bucket_entry(
-                    doc_count,
-                    reborrow_opt_collector(&mut sub_agg_collector),
-                    agg_data,
-                )?;
-                let val: u128 = compact_space_accessor.compact_to_u128(val as u32);
-                let val = Ipv6Addr::from_u128(val);
-                out.push((IntermediateKey::IpAddr(val), intermediate_entry));
-            }
-        } else if column_type == ColumnType::F64 {
-            // -0.0 and +0.0 both normalize to I64(0). Sort by normalized key to merge their
-            // buckets below. Other distinct f64 encodings, including NaNs, remain distinct:
-            // NaNs are not normalized and IntermediateKey compares them using total_cmp.
-            let normalized_key = |val: u64| -> IntermediateKey {
-                NumericalValue::from(f64::from_u64(val)).normalize().into()
-            };
-            entries.sort_unstable_by_key(|(val, _)| normalized_key(*val));
-
-            for (val, bucket) in entries {
-                let key = normalized_key(val);
-                let intermediate_entry = into_intermediate_bucket_entry(
-                    bucket,
-                    reborrow_opt_collector(&mut sub_agg_collector),
-                    agg_data,
-                )?;
-                match out.last_mut() {
-                    Some((previous_key, existing)) if previous_key == &key => {
-                        existing.doc_count += intermediate_entry.doc_count;
-                        existing
-                            .sub_aggregation
-                            .merge_fruits(intermediate_entry.sub_aggregation)?;
-                    }
-                    _ => out.push((key, intermediate_entry)),
-                }
-            }
-        } else {
-            for (val, bucket) in entries {
-                let intermediate_entry = into_intermediate_bucket_entry(
-                    bucket,
-                    reborrow_opt_collector(&mut sub_agg_collector),
-                    agg_data,
-                )?;
-                let key_val: NumericalValue = match column_type {
-                    ColumnType::U64 => val.into(),
-                    ColumnType::I64 => i64::from_u64(val).into(),
-                    _ => {
-                        return Err(TantivyError::SchemaError(format!(
-                            "unknown key type: {}",
-                            column_type
-                        )))
-                    }
-                };
-                out.push((key_val.normalize().into(), intermediate_entry));
-            }
+    let column_type = term_req.accessor.column_type();
+    if column_type == ColumnType::Str {
+        // `ValueSource::term_dictionary` guarantees a dictionary for every `Str` source.
+        let Some(term_dict) = term_req.accessor.term_dictionary() else {
+            return Err(crate::TantivyError::InternalError(
+                "a `Str` value source must provide a term dictionary".to_string(),
+            ));
         };
 
-        Ok(IntermediateBucketResult::Terms {
-            buckets: IntermediateTermBucketResult {
-                entries: out,
-                sum_other_doc_count,
-                doc_count_error_upper_bound: term_doc_count_before_cutoff,
-                ..Default::default()
-            },
-        })
-    }
+        // Collect into a map to dedup by key, then flush into `out`. Two cases need it: a real
+        // term may equal the `missing` placeholder, and the min_doc_count==0 fill must skip
+        // already-collected terms. A single-segment query returns this result directly (the
+        // cross-segment merge that would otherwise dedup never runs), so duplicate keys here
+        // would reach the final result unmerged.
+        let mut intermediate_entry_map: FxHashMap<IntermediateKey, IntermediateTermBucketEntry> =
+            FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+
+        if let Some((intermediate_key, bucket)) = extract_missing_value(&mut entries, term_req) {
+            let intermediate_entry = into_intermediate_bucket_entry(
+                bucket,
+                reborrow_opt_collector(&mut sub_agg_collector),
+                agg_data,
+            )?;
+            intermediate_entry_map.insert(intermediate_key, intermediate_entry);
+        }
+
+        // Sort by term ord
+        entries.sort_unstable_by_key(|bucket| bucket.0);
+
+        let (term_ids, buckets): (Vec<u64>, Vec<Bucket<B>>) = entries.into_iter().unzip();
+
+        let intermediate_entries: Vec<IntermediateTermBucketEntry> = buckets
+            .into_iter()
+            .map(|bucket| {
+                into_intermediate_bucket_entry(
+                    bucket,
+                    reborrow_opt_collector(&mut sub_agg_collector),
+                    agg_data,
+                )
+            })
+            .collect::<crate::Result<_>>()?;
+
+        let mut intermediate_entry_it = intermediate_entries.into_iter();
+
+        term_dict.sorted_ords_to_term_cb(&term_ids[..], &mut |term| {
+            let intermediate_entry = intermediate_entry_it.next().unwrap();
+            intermediate_entry_map.insert(
+                IntermediateKey::Str(
+                    String::from_utf8(term.to_vec()).expect("could not convert to String"),
+                ),
+                intermediate_entry,
+            );
+        })?;
+
+        // If min_doc_count is 0, we need to complete the results with terms that are part of
+        // the dictionary, but not part of the search results.
+        if term_req.req.min_doc_count == 0 {
+            // That feature only works on physical str column (with a term dictionary)
+            if let Some(str_column) = term_req.accessor.as_physical_str_column() {
+                fill_zero_doc_count_terms(str_column, term_req, &mut intermediate_entry_map)?;
+            }
+        }
+
+        out.extend(intermediate_entry_map);
+    } else if column_type == ColumnType::DateTime {
+        for (val, doc_count) in entries {
+            let intermediate_entry = into_intermediate_bucket_entry(
+                doc_count,
+                reborrow_opt_collector(&mut sub_agg_collector),
+                agg_data,
+            )?;
+            let val = i64::from_u64(val);
+            let date = format_date(val)?;
+            out.push((IntermediateKey::Str(date), intermediate_entry));
+        }
+    } else if column_type == ColumnType::Bool {
+        for (val, doc_count) in entries {
+            let intermediate_entry = into_intermediate_bucket_entry(
+                doc_count,
+                reborrow_opt_collector(&mut sub_agg_collector),
+                agg_data,
+            )?;
+            let val = bool::from_u64(val);
+            out.push((IntermediateKey::Bool(val), intermediate_entry));
+        }
+    } else if column_type == ColumnType::IpAddr {
+        let compact_space_accessor = term_req
+            .accessor
+            .as_physical_column()
+            .ok_or_else(|| {
+                TantivyError::AggregationError(crate::aggregation::AggregationError::InternalError(
+                    "IpAddr term keys require a physical column".to_string(),
+                ))
+            })?
+            .values
+            .clone()
+            .downcast_arc::<CompactSpaceU64Accessor>()
+            .map_err(|_| {
+                TantivyError::AggregationError(crate::aggregation::AggregationError::InternalError(
+                    "Type mismatch: Could not downcast to CompactSpaceU64Accessor".to_string(),
+                ))
+            })?;
+
+        for (val, doc_count) in entries {
+            let intermediate_entry = into_intermediate_bucket_entry(
+                doc_count,
+                reborrow_opt_collector(&mut sub_agg_collector),
+                agg_data,
+            )?;
+            let val: u128 = compact_space_accessor.compact_to_u128(val as u32);
+            let val = Ipv6Addr::from_u128(val);
+            out.push((IntermediateKey::IpAddr(val), intermediate_entry));
+        }
+    } else if column_type == ColumnType::F64 {
+        // -0.0 and +0.0 both normalize to I64(0). Sort by normalized key to merge their
+        // buckets below. Other distinct f64 encodings, including NaNs, remain distinct:
+        // NaNs are not normalized and IntermediateKey compares them using total_cmp.
+        let normalized_key = |val: u64| -> IntermediateKey {
+            NumericalValue::from(f64::from_u64(val)).normalize().into()
+        };
+        entries.sort_unstable_by_key(|(val, _)| normalized_key(*val));
+
+        for (val, bucket) in entries {
+            let key = normalized_key(val);
+            let intermediate_entry = into_intermediate_bucket_entry(
+                bucket,
+                reborrow_opt_collector(&mut sub_agg_collector),
+                agg_data,
+            )?;
+            match out.last_mut() {
+                Some((previous_key, existing)) if previous_key == &key => {
+                    existing.doc_count += intermediate_entry.doc_count;
+                    existing
+                        .sub_aggregation
+                        .merge_fruits(intermediate_entry.sub_aggregation)?;
+                }
+                _ => out.push((key, intermediate_entry)),
+            }
+        }
+    } else {
+        for (val, bucket) in entries {
+            let intermediate_entry = into_intermediate_bucket_entry(
+                bucket,
+                reborrow_opt_collector(&mut sub_agg_collector),
+                agg_data,
+            )?;
+            let key_val: NumericalValue = match column_type {
+                ColumnType::U64 => val.into(),
+                ColumnType::I64 => i64::from_u64(val).into(),
+                _ => {
+                    return Err(TantivyError::SchemaError(format!(
+                        "unknown key type: {}",
+                        column_type
+                    )))
+                }
+            };
+            out.push((key_val.normalize().into(), intermediate_entry));
+        }
+    };
+
+    Ok(IntermediateBucketResult::Terms {
+        buckets: IntermediateTermBucketResult {
+            entries: out,
+            sum_other_doc_count,
+            doc_count_error_upper_bound: term_doc_count_before_cutoff,
+            ..Default::default()
+        },
+    })
 }
 
 impl<TermMap: TermAggregationMap, B: SubAggBuffer> SegmentTermCollector<TermMap, B> {

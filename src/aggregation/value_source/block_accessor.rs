@@ -244,6 +244,12 @@ impl ColumnBlockAccessor {
         self.val_cache.truncate(new_len);
     }
 
+    /// Returns the cardinality hint of the last fetched block.
+    #[inline]
+    pub(crate) fn cardinality(&self) -> Cardinality {
+        self.cardinality
+    }
+
     /// Returns the values fetched by the last `fetch_block*` call.
     #[inline]
     pub(crate) fn values(&self) -> &[u64] {
