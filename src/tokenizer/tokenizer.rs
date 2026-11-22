@@ -1,8 +1,12 @@
 /// The tokenizer module contains all of the tools used to process
 /// text in `tantivy`.
+use std::any::Any;
+
 use tokenizer_api::{BoxTokenStream, TokenFilter, Tokenizer};
 
 use crate::tokenizer::empty_tokenizer::EmptyTokenizer;
+use crate::tokenizer::raw_tokenizer::RawTokenizer;
+use crate::tokenizer::remove_long::RemoveLongFilterWrapper;
 
 /// `TextAnalyzer` tokenizes an input text into tokens and modifies the resulting `TokenStream`.
 #[derive(Clone)]
@@ -35,6 +39,8 @@ pub trait BoxableTokenizer: 'static + Send + Sync {
     fn box_token_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a>;
     /// Clone this tokenizer.
     fn box_clone(&self) -> Box<dyn BoxableTokenizer>;
+    /// Downcast handle for concrete-tokenizer fast paths (e.g. `RawTokenizer`).
+    fn as_any(&self) -> &dyn Any;
 }
 
 impl<T: Tokenizer> BoxableTokenizer for T {
@@ -43,6 +49,9 @@ impl<T: Tokenizer> BoxableTokenizer for T {
     }
     fn box_clone(&self) -> Box<dyn BoxableTokenizer> {
         Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -67,6 +76,24 @@ impl TextAnalyzer {
     /// Creates a token stream for a given `str`.
     pub fn token_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
         self.tokenizer.token_stream(text)
+    }
+
+    /// If this analyzer passes input `&str` through verbatim as a single token (either
+    /// `RawTokenizer` or `RawTokenizer` + `RemoveLongFilter`), returns `Some(max_len_exclusive)`.
+    ///
+    /// Allows hot indexing loops (`FastFieldsWriter`, `InvertedIndexPluginWriter`) to bypass
+    /// `BoxTokenStream` allocation and `Token.text` string copying.
+    pub(crate) fn raw_pass_through_limit(&self) -> Option<usize> {
+        // Dereference the `Box` so `as_any()` dispatches through the trait object vtable to the
+        // concrete inner tokenizer rather than `<Box<dyn BoxableTokenizer> as BoxableTokenizer>`.
+        let any = (*self.tokenizer).as_any();
+        if any.is::<RawTokenizer>() {
+            return Some(usize::MAX);
+        }
+        if let Some(wrapper) = any.downcast_ref::<RemoveLongFilterWrapper<RawTokenizer>>() {
+            return Some(wrapper.length_limit);
+        }
+        None
     }
 }
 
@@ -125,6 +152,28 @@ mod tests {
 
     use super::*;
     use crate::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer};
+
+    #[test]
+    fn test_raw_pass_through_limit() {
+        let raw_only = TextAnalyzer::from(RawTokenizer::default());
+        assert_eq!(raw_only.raw_pass_through_limit(), Some(usize::MAX));
+
+        let raw_with_limit = TextAnalyzer::builder(RawTokenizer::default())
+            .filter(RemoveLongFilter::limit(256))
+            .build();
+        assert_eq!(raw_with_limit.raw_pass_through_limit(), Some(256));
+
+        let raw_lowercased = TextAnalyzer::builder(RawTokenizer::default())
+            .filter(LowerCaser)
+            .filter(RemoveLongFilter::limit(256))
+            .build();
+        assert_eq!(raw_lowercased.raw_pass_through_limit(), None);
+
+        let simple = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(40))
+            .build();
+        assert_eq!(simple.raw_pass_through_limit(), None);
+    }
 
     #[test]
     fn test_text_analyzer_builder() {

@@ -1,5 +1,3 @@
-use std::str::CharIndices;
-
 use super::{Token, TokenStream, Tokenizer};
 
 /// Tokenize the text by splitting on whitespaces and punctuation.
@@ -11,7 +9,7 @@ pub struct SimpleTokenizer {
 /// TokenStream produced by the `SimpleTokenizer`.
 pub struct SimpleTokenStream<'a> {
     text: &'a str,
-    chars: CharIndices<'a>,
+    byte_offset: usize,
     token: &'a mut Token,
 }
 
@@ -21,36 +19,79 @@ impl Tokenizer for SimpleTokenizer {
         self.token.reset();
         SimpleTokenStream {
             text,
-            chars: text.char_indices(),
+            byte_offset: 0,
             token: &mut self.token,
         }
     }
 }
 
 impl SimpleTokenStream<'_> {
-    // search for the end of the current token.
+    // Search for the end of the current token, using an ASCII fast path before decoding UTF-8.
+    #[inline]
     fn search_token_end(&mut self) -> usize {
-        (&mut self.chars)
-            .filter(|(_, c)| !c.is_alphanumeric())
-            .map(|(offset, _)| offset)
-            .next()
-            .unwrap_or(self.text.len())
+        let bytes = self.text.as_bytes();
+        let len = bytes.len();
+        let mut pos = self.byte_offset;
+        while pos < len {
+            let byte = bytes[pos];
+            if byte < 0x80 {
+                if !byte.is_ascii_alphanumeric() {
+                    self.byte_offset = pos + 1;
+                    return pos;
+                }
+                pos += 1;
+            } else {
+                let ch = self.text[pos..].chars().next().unwrap();
+                let ch_len = ch.len_utf8();
+                if !ch.is_alphanumeric() {
+                    self.byte_offset = pos + ch_len;
+                    return pos;
+                }
+                pos += ch_len;
+            }
+        }
+        self.byte_offset = len;
+        len
     }
 }
 
 impl TokenStream for SimpleTokenStream<'_> {
+    #[inline]
     fn advance(&mut self) -> bool {
         self.token.text.clear();
         self.token.position = self.token.position.wrapping_add(1);
-        while let Some((offset_from, c)) = self.chars.next() {
-            if c.is_alphanumeric() {
-                let offset_to = self.search_token_end();
-                self.token.offset_from = offset_from;
-                self.token.offset_to = offset_to;
-                self.token.text.push_str(&self.text[offset_from..offset_to]);
-                return true;
+        let bytes = self.text.as_bytes();
+        let len = bytes.len();
+        let mut pos = self.byte_offset;
+        while pos < len {
+            let byte = bytes[pos];
+            if byte < 0x80 {
+                if byte.is_ascii_alphanumeric() {
+                    let offset_from = pos;
+                    self.byte_offset = pos + 1;
+                    let offset_to = self.search_token_end();
+                    self.token.offset_from = offset_from;
+                    self.token.offset_to = offset_to;
+                    self.token.text.push_str(&self.text[offset_from..offset_to]);
+                    return true;
+                }
+                pos += 1;
+            } else {
+                let ch = self.text[pos..].chars().next().unwrap();
+                let ch_len = ch.len_utf8();
+                if ch.is_alphanumeric() {
+                    let offset_from = pos;
+                    self.byte_offset = pos + ch_len;
+                    let offset_to = self.search_token_end();
+                    self.token.offset_from = offset_from;
+                    self.token.offset_to = offset_to;
+                    self.token.text.push_str(&self.text[offset_from..offset_to]);
+                    return true;
+                }
+                pos += ch_len;
             }
         }
+        self.byte_offset = len;
         false
     }
 

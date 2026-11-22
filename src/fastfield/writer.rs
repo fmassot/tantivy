@@ -1,6 +1,6 @@
 use std::io;
 
-use columnar::{ColumnarWriter, NumericalValue};
+use columnar::{ColumnHandle, ColumnType, ColumnarWriter, NumericalValue};
 use common::{DateTimePrecision, JsonPathWriter};
 use tokenizer_api::Token;
 
@@ -32,11 +32,46 @@ fn resolve_fast_field_tokenizer(
     Ok(Some(text_analyzer))
 }
 
+/// Direct handle into one of [`ColumnarWriter`]'s typed field maps.
+///
+/// Storing the column kind alongside the handle guarantees that mismatched runtime value types
+/// (e.g. writing an `IpAddr` into a `u64` schema field) safely fall back to the name-based map
+/// instead of accessing the wrong arena.
+#[derive(Clone, Copy, Debug)]
+enum TypedColumnHandle {
+    Numerical(ColumnHandle),
+    Str(ColumnHandle),
+    Bytes(ColumnHandle),
+    DateTime(ColumnHandle),
+    Bool(ColumnHandle),
+    IpAddr(ColumnHandle),
+}
+
+impl TypedColumnHandle {
+    #[inline]
+    fn from_type_and_handle(column_type: ColumnType, handle: ColumnHandle) -> Self {
+        match column_type {
+            ColumnType::I64 | ColumnType::U64 | ColumnType::F64 => Self::Numerical(handle),
+            ColumnType::Str => Self::Str(handle),
+            ColumnType::Bytes => Self::Bytes(handle),
+            ColumnType::DateTime => Self::DateTime(handle),
+            ColumnType::Bool => Self::Bool(handle),
+            ColumnType::IpAddr => Self::IpAddr(handle),
+        }
+    }
+}
+
 /// The `FastFieldsWriter` groups all of the fast field writers.
 pub struct FastFieldsWriter {
     columnar_writer: ColumnarWriter,
-    fast_field_names: Vec<Option<String>>, //< TODO see if we can hash the field name hash too.
+    fast_field_names: Vec<Option<String>>,
+    /// Direct typed handles into `columnar_writer` for static schema fields, avoiding per-cell
+    /// field-name hashing and `ArenaHashMap` probing.
+    column_handles: Vec<Option<TypedColumnHandle>>,
     per_field_tokenizer: Vec<Option<TextAnalyzer>>,
+    /// When `Some(limit)`, the field's fast-field tokenizer is `RawTokenizer` (optionally wrapped
+    /// in `RemoveLongFilter::limit(limit)`), allowing zero-copy recording without `Token` copying.
+    per_field_raw_limit: Vec<Option<usize>>,
     date_precisions: Vec<DateTimePrecision>,
     expand_dots: Vec<bool>,
     num_docs: DocId,
@@ -59,12 +94,14 @@ impl FastFieldsWriter {
         let mut columnar_writer = ColumnarWriter::default();
 
         let mut fast_field_names: Vec<Option<String>> = vec![None; schema.num_fields()];
+        let mut column_handles: Vec<Option<TypedColumnHandle>> = vec![None; schema.num_fields()];
         let mut date_precisions: Vec<DateTimePrecision> =
             std::iter::repeat_with(DateTimePrecision::default)
                 .take(schema.num_fields())
                 .collect();
         let mut expand_dots = vec![false; schema.num_fields()];
         let mut per_field_tokenizer: Vec<Option<TextAnalyzer>> = vec![None; schema.num_fields()];
+        let mut per_field_raw_limit: Vec<Option<usize>> = vec![None; schema.num_fields()];
         // TODO see other types
         for (field_id, field_entry) in schema.fields() {
             if !field_entry.field_type().is_fast() {
@@ -74,39 +111,47 @@ impl FastFieldsWriter {
                 columnar_writer.record_tie_breaker_column(field_entry.name());
                 continue;
             }
-            fast_field_names[field_id.field_id() as usize] = Some(field_entry.name().to_string());
+            let idx = field_id.field_id() as usize;
+            fast_field_names[idx] = Some(field_entry.name().to_string());
             let value_type = field_entry.field_type().value_type();
             if let FieldType::Date(date_options) = field_entry.field_type() {
-                date_precisions[field_id.field_id() as usize] = date_options.get_precision();
+                date_precisions[idx] = date_options.get_precision();
             }
             if let FieldType::JsonObject(json_object_options) = field_entry.field_type() {
-                per_field_tokenizer[field_id.field_id() as usize] = resolve_fast_field_tokenizer(
+                per_field_tokenizer[idx] = resolve_fast_field_tokenizer(
                     &tokenizer_manager,
                     json_object_options.get_fast_field_tokenizer_name(),
                 )?;
-                expand_dots[field_id.field_id() as usize] =
-                    json_object_options.is_expand_dots_enabled();
+                expand_dots[idx] = json_object_options.is_expand_dots_enabled();
             }
             if let FieldType::Str(text_options) = field_entry.field_type() {
-                per_field_tokenizer[field_id.field_id() as usize] = resolve_fast_field_tokenizer(
+                let tokenizer_opt = resolve_fast_field_tokenizer(
                     &tokenizer_manager,
                     text_options.get_fast_field_tokenizer_name(),
                 )?;
+                per_field_raw_limit[idx] = tokenizer_opt
+                    .as_ref()
+                    .and_then(TextAnalyzer::raw_pass_through_limit);
+                per_field_tokenizer[idx] = tokenizer_opt;
             }
 
             let sort_values_within_row = value_type == Type::Facet;
             if let Some(column_type) = value_type_to_column_type(value_type) {
-                columnar_writer.record_column_type(
+                let handle = columnar_writer.record_column_type_with_handle(
                     field_entry.name(),
                     column_type,
                     sort_values_within_row,
                 );
+                column_handles[idx] =
+                    Some(TypedColumnHandle::from_type_and_handle(column_type, handle));
             }
         }
         Ok(FastFieldsWriter {
             columnar_writer,
             fast_field_names,
+            column_handles,
             per_field_tokenizer,
+            per_field_raw_limit,
             num_docs: 0u32,
             date_precisions,
             expand_dots,
@@ -141,76 +186,151 @@ impl FastFieldsWriter {
         Ok(())
     }
 
+    #[inline]
     fn add_doc_value<'a, V: Value<'a>>(
         &mut self,
         doc_id: DocId,
         field: Field,
         value: V,
     ) -> crate::Result<()> {
-        let field_name = match &self.fast_field_names[field.field_id() as usize] {
+        let field_idx = field.field_id() as usize;
+        let field_name = match &self.fast_field_names[field_idx] {
             None => return Ok(()),
             Some(name) => name,
         };
+        let handle_opt = self.column_handles[field_idx];
 
         match value.as_value() {
             ReferenceValue::Leaf(leaf) => match leaf {
                 ReferenceValueLeaf::Null => {}
                 ReferenceValueLeaf::Str(val) => {
-                    if let Some(tokenizer) =
-                        &mut self.per_field_tokenizer[field.field_id() as usize]
-                    {
+                    if let Some(limit) = self.per_field_raw_limit[field_idx] {
+                        if val.len() < limit {
+                            if let Some(TypedColumnHandle::Str(handle)) = handle_opt {
+                                self.columnar_writer.record_str_by_handle(doc_id, handle, val);
+                            } else {
+                                self.columnar_writer.record_str(doc_id, field_name, val);
+                            }
+                        }
+                    } else if let Some(tokenizer) = &mut self.per_field_tokenizer[field_idx] {
                         let mut token_stream = tokenizer.token_stream(val);
-                        token_stream.process(&mut |token: &Token| {
-                            self.columnar_writer
-                                .record_str(doc_id, field_name, &token.text);
-                        })
+                        if let Some(TypedColumnHandle::Str(handle)) = handle_opt {
+                            token_stream.process(&mut |token: &Token| {
+                                self.columnar_writer
+                                    .record_str_by_handle(doc_id, handle, &token.text);
+                            });
+                        } else {
+                            token_stream.process(&mut |token: &Token| {
+                                self.columnar_writer
+                                    .record_str(doc_id, field_name, &token.text);
+                            });
+                        }
+                    } else if let Some(TypedColumnHandle::Str(handle)) = handle_opt {
+                        self.columnar_writer.record_str_by_handle(doc_id, handle, val);
                     } else {
                         self.columnar_writer.record_str(doc_id, field_name, val);
                     }
                 }
                 ReferenceValueLeaf::U64(val) => {
-                    self.columnar_writer.record_numerical(
-                        doc_id,
-                        field_name,
-                        NumericalValue::from(val),
-                    );
+                    if let Some(TypedColumnHandle::Numerical(handle)) = handle_opt {
+                        self.columnar_writer.record_numerical_by_handle(
+                            doc_id,
+                            handle,
+                            NumericalValue::from(val),
+                        );
+                    } else {
+                        self.columnar_writer.record_numerical(
+                            doc_id,
+                            field_name,
+                            NumericalValue::from(val),
+                        );
+                    }
                 }
                 ReferenceValueLeaf::I64(val) => {
-                    self.columnar_writer.record_numerical(
-                        doc_id,
-                        field_name,
-                        NumericalValue::from(val),
-                    );
+                    if let Some(TypedColumnHandle::Numerical(handle)) = handle_opt {
+                        self.columnar_writer.record_numerical_by_handle(
+                            doc_id,
+                            handle,
+                            NumericalValue::from(val),
+                        );
+                    } else {
+                        self.columnar_writer.record_numerical(
+                            doc_id,
+                            field_name,
+                            NumericalValue::from(val),
+                        );
+                    }
                 }
                 ReferenceValueLeaf::F64(val) => {
-                    self.columnar_writer.record_numerical(
-                        doc_id,
-                        field_name,
-                        NumericalValue::from(val),
-                    );
+                    if let Some(TypedColumnHandle::Numerical(handle)) = handle_opt {
+                        self.columnar_writer.record_numerical_by_handle(
+                            doc_id,
+                            handle,
+                            NumericalValue::from(val),
+                        );
+                    } else {
+                        self.columnar_writer.record_numerical(
+                            doc_id,
+                            field_name,
+                            NumericalValue::from(val),
+                        );
+                    }
                 }
                 ReferenceValueLeaf::Date(val) => {
-                    let date_precision = self.date_precisions[field.field_id() as usize];
+                    let date_precision = self.date_precisions[field_idx];
                     let truncated_datetime = val.truncate(date_precision);
-                    self.columnar_writer
-                        .record_datetime(doc_id, field_name, truncated_datetime);
+                    if let Some(TypedColumnHandle::DateTime(handle)) = handle_opt {
+                        self.columnar_writer.record_datetime_by_handle(
+                            doc_id,
+                            handle,
+                            truncated_datetime,
+                        );
+                    } else {
+                        self.columnar_writer
+                            .record_datetime(doc_id, field_name, truncated_datetime);
+                    }
                 }
                 ReferenceValueLeaf::Facet(val) => {
-                    self.columnar_writer.record_str(doc_id, field_name, val);
+                    if let Some(TypedColumnHandle::Str(handle)) = handle_opt {
+                        self.columnar_writer.record_str_by_handle(doc_id, handle, val);
+                    } else {
+                        self.columnar_writer.record_str(doc_id, field_name, val);
+                    }
                 }
                 ReferenceValueLeaf::Bytes(val) => {
-                    self.columnar_writer.record_bytes(doc_id, field_name, val);
+                    if let Some(TypedColumnHandle::Bytes(handle)) = handle_opt {
+                        self.columnar_writer
+                            .record_bytes_by_handle(doc_id, handle, val);
+                    } else {
+                        self.columnar_writer.record_bytes(doc_id, field_name, val);
+                    }
                 }
                 ReferenceValueLeaf::IpAddr(val) => {
-                    self.columnar_writer.record_ip_addr(doc_id, field_name, val);
+                    if let Some(TypedColumnHandle::IpAddr(handle)) = handle_opt {
+                        self.columnar_writer
+                            .record_ip_addr_by_handle(doc_id, handle, val);
+                    } else {
+                        self.columnar_writer.record_ip_addr(doc_id, field_name, val);
+                    }
                 }
                 ReferenceValueLeaf::Bool(val) => {
-                    self.columnar_writer.record_bool(doc_id, field_name, val);
+                    if let Some(TypedColumnHandle::Bool(handle)) = handle_opt {
+                        self.columnar_writer.record_bool_by_handle(doc_id, handle, val);
+                    } else {
+                        self.columnar_writer.record_bool(doc_id, field_name, val);
+                    }
                 }
                 ReferenceValueLeaf::PreTokStr(val) => {
-                    for token in &val.tokens {
-                        self.columnar_writer
-                            .record_str(doc_id, field_name, &token.text);
+                    if let Some(TypedColumnHandle::Str(handle)) = handle_opt {
+                        for token in &val.tokens {
+                            self.columnar_writer
+                                .record_str_by_handle(doc_id, handle, &token.text);
+                        }
+                    } else {
+                        for token in &val.tokens {
+                            self.columnar_writer
+                                .record_str(doc_id, field_name, &token.text);
+                        }
                     }
                 }
                 // Custom fields are never fast (`is_fast() == false`), so they are not registered
@@ -226,14 +346,14 @@ impl FastFieldsWriter {
                 }
             }
             ReferenceValue::Object(val) => {
-                let expand_dots = self.expand_dots[field.field_id() as usize];
+                let expand_dots = self.expand_dots[field_idx];
                 self.json_path_buffer.clear();
                 // First field should not be expanded.
                 self.json_path_buffer.set_expand_dots(false);
                 self.json_path_buffer.push(field_name);
                 self.json_path_buffer.set_expand_dots(expand_dots);
 
-                let text_analyzer = &mut self.per_field_tokenizer[field.field_id() as usize];
+                let text_analyzer = &mut self.per_field_tokenizer[field_idx];
 
                 record_json_obj_to_columnar_writer::<V>(
                     doc_id,

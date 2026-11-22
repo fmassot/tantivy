@@ -1,7 +1,34 @@
 use std::io;
 
-use zstd::bulk::{compress_to_buffer, decompress_to_buffer};
+use zstd::bulk::{compress_to_buffer, decompress_to_buffer, Compressor as ZstdBulkCompressor};
 use zstd::DEFAULT_COMPRESSION_LEVEL;
+
+pub(crate) fn new_zstd_compressor(
+    compression_level: Option<i32>,
+) -> io::Result<ZstdBulkCompressor<'static>> {
+    ZstdBulkCompressor::new(compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL))
+}
+
+#[inline]
+pub(crate) fn compress_with_compressor(
+    compressor: &mut ZstdBulkCompressor<'static>,
+    uncompressed: &[u8],
+    compressed: &mut Vec<u8>,
+) -> io::Result<()> {
+    let count_size = std::mem::size_of::<u32>();
+    let max_size = zstd::zstd_safe::compress_bound(uncompressed.len()) + count_size;
+
+    compressed.clear();
+    compressed.resize(max_size, 0);
+
+    let compressed_size =
+        compressor.compress_to_buffer(uncompressed, &mut compressed[count_size..])?;
+
+    compressed[0..count_size].copy_from_slice(&(uncompressed.len() as u32).to_le_bytes());
+    compressed.resize(compressed_size + count_size, 0);
+
+    Ok(())
+}
 
 #[inline]
 pub fn compress(

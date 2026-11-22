@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use columnar::MonotonicallyMappableToU64;
 use common::JsonPathWriter;
-use itertools::Itertools;
 use measure_time::debug_time;
 use tokenizer_api::BoxTokenStream;
 
@@ -34,7 +33,9 @@ use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::space_usage::{ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, TERMDICT};
 use crate::termdict::{TermMerger, TermOrdinal};
-use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
+use crate::tokenizer::{
+    FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer, MAX_TOKEN_LEN,
+};
 use crate::{DocId, InvertedIndexReader, TantivyError};
 
 /// Built-in segment plugin that stores and merges the inverted index.
@@ -136,6 +137,9 @@ pub struct InvertedIndexPluginWriter {
     schema: Schema,
     per_field_postings_writers: PerFieldPostingsWriter,
     per_field_text_analyzers: Vec<TextAnalyzer>,
+    /// When `Some(limit)`, the field's text analyzer is `RawTokenizer` (optionally wrapped in
+    /// `RemoveLongFilter::limit(limit)`), allowing zero-copy indexing without `Token` copying.
+    per_field_raw_limit: Vec<Option<usize>>,
     fieldnorms_writer: FieldNormsWriter,
     term_buffer: IndexingTerm,
     json_path_writer: JsonPathWriter,
@@ -174,6 +178,11 @@ impl InvertedIndexPluginWriter {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let per_field_raw_limit: Vec<Option<usize>> = per_field_text_analyzers
+            .iter()
+            .map(TextAnalyzer::raw_pass_through_limit)
+            .collect();
+
         let fieldnorm_path = segment.relative_path(SegmentComponent::FieldNorms);
         let fieldnorm_write = segment.index().directory().open_write(&fieldnorm_path)?;
 
@@ -181,6 +190,7 @@ impl InvertedIndexPluginWriter {
         Ok(InvertedIndexPluginWriter {
             per_field_postings_writers: PerFieldPostingsWriter::for_schema(&schema),
             per_field_text_analyzers,
+            per_field_raw_limit,
             fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
             term_buffer: IndexingTerm::with_capacity(16),
             json_path_writer: JsonPathWriter::default(),
@@ -201,13 +211,38 @@ impl InvertedIndexPluginWriter {
         doc_id: DocId,
         doc: &D,
     ) -> crate::Result<()> {
-        let vals_grouped_by_field = doc
-            .iter_fields_and_values()
-            .sorted_by_key(|(field, _)| *field)
-            .chunk_by(|(field, _)| *field);
+        // Filter out non-indexed fields first and avoid heap allocations in the common case.
+        let mut indexed_vals: smallvec::SmallVec<[(Field, D::Value<'_>); 16]> =
+            smallvec::SmallVec::new();
+        let mut is_sorted = true;
+        let mut prev_field: Option<Field> = None;
+        for (field, value) in doc.iter_fields_and_values() {
+            if !self.schema.get_field_entry(field).is_indexed() {
+                continue;
+            }
+            if let Some(prev) = prev_field {
+                if field < prev {
+                    is_sorted = false;
+                }
+            }
+            prev_field = Some(field);
+            indexed_vals.push((field, value));
+        }
+        if !is_sorted {
+            indexed_vals.sort_by_key(|(field, _)| *field);
+        }
 
-        for (field, field_values) in &vals_grouped_by_field {
-            let values = field_values.map(|el| el.1);
+        let mut group_start = 0;
+        while group_start < indexed_vals.len() {
+            let field = indexed_vals[group_start].0;
+            let mut group_end = group_start + 1;
+            while group_end < indexed_vals.len() && indexed_vals[group_end].0 == field {
+                group_end += 1;
+            }
+            let values = indexed_vals[group_start..group_end]
+                .iter()
+                .map(|(_, val)| val.clone());
+            group_start = group_end;
 
             let field_entry = self.schema.get_field_entry(field);
             let make_schema_error = || {
@@ -217,9 +252,6 @@ impl InvertedIndexPluginWriter {
                     field_entry.name()
                 ))
             };
-            if !field_entry.is_indexed() {
-                continue;
-            }
 
             let (term_buffer, ctx) = (&mut self.term_buffer, &mut self.ctx);
             let postings_writer: &mut dyn PostingsWriter =
@@ -245,13 +277,33 @@ impl InvertedIndexPluginWriter {
                     }
                 }
                 FieldType::Str(_) => {
+                    const POSITION_GAP: u32 = 1;
+                    let field_idx = field.field_id() as usize;
+                    let raw_limit_opt = self.per_field_raw_limit[field_idx];
                     let mut indexing_position = IndexingPosition::default();
                     for value in values {
                         let value = value.as_value();
 
+                        if let (Some(limit), Some(text)) = (raw_limit_opt, value.as_str()) {
+                            if text.len() >= limit {
+                                indexing_position.end_position += POSITION_GAP;
+                                continue;
+                            }
+                            if text.len() <= MAX_TOKEN_LEN {
+                                debug_assert!(term_buffer.is_empty());
+                                let end_of_path_idx = term_buffer.len_bytes();
+                                term_buffer.append_bytes(text.as_bytes());
+                                let start_position = indexing_position.end_position;
+                                postings_writer.subscribe(doc_id, start_position, term_buffer, ctx);
+                                indexing_position.end_position = start_position + 1 + POSITION_GAP;
+                                indexing_position.num_tokens += 1;
+                                term_buffer.truncate_value_bytes(end_of_path_idx);
+                                continue;
+                            }
+                        }
+
                         let mut token_stream = if let Some(text) = value.as_str() {
-                            let text_analyzer =
-                                &mut self.per_field_text_analyzers[field.field_id() as usize];
+                            let text_analyzer = &mut self.per_field_text_analyzers[field_idx];
                             text_analyzer.token_stream(text)
                         } else if let Some(tok_str) = value.into_pre_tokenized_text() {
                             BoxTokenStream::new(PreTokenizedStream::from(*tok_str.clone()))

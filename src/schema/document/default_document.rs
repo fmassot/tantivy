@@ -5,6 +5,7 @@ use std::net::Ipv6Addr;
 use columnar::MonotonicallyMappableToU128;
 use common::{read_u32_vint_no_advance, serialize_vint_u32, BinarySerializable, DateTime, VInt};
 use serde_json::Map;
+use smallvec::SmallVec;
 pub use CompactDoc as TantivyDocument;
 
 use super::{ReferenceValue, ReferenceValueLeaf, Value};
@@ -47,9 +48,14 @@ impl CompactDoc {
     /// Creates a new, empty document object
     /// The reserved capacity is for the total serialized data
     pub fn with_capacity(bytes: usize) -> CompactDoc {
+        Self::with_capacity_and_num_fields(bytes, 12)
+    }
+
+    /// Creates a new, empty document object with pre-reserved data and field-entry capacities.
+    pub fn with_capacity_and_num_fields(bytes: usize, num_fields: usize) -> CompactDoc {
         CompactDoc {
             node_data: Vec::with_capacity(bytes),
-            field_values: Vec::with_capacity(4),
+            field_values: Vec::with_capacity(num_fields),
         }
     }
 
@@ -246,6 +252,7 @@ impl CompactDoc {
         Ok(doc)
     }
 
+    #[inline]
     fn add_value_leaf(&mut self, leaf: ReferenceValueLeaf) -> ValueAddr {
         let type_id = ValueType::from(&leaf);
         // Write into `node_data` and return u32 position as its address
@@ -260,56 +267,96 @@ impl CompactDoc {
             }
             ReferenceValueLeaf::Bytes(bytes) => write_bytes_into(&mut self.node_data, bytes),
             ReferenceValueLeaf::Custom(bytes) => write_bytes_into(&mut self.node_data, bytes),
-            ReferenceValueLeaf::U64(num) => write_into(&mut self.node_data, num),
-            ReferenceValueLeaf::I64(num) => write_into(&mut self.node_data, num),
+            ReferenceValueLeaf::U64(num) => {
+                let pos = self.node_data.len() as u32;
+                self.node_data.extend_from_slice(&num.to_le_bytes());
+                pos
+            }
+            ReferenceValueLeaf::I64(num) => {
+                let pos = self.node_data.len() as u32;
+                self.node_data.extend_from_slice(&num.to_le_bytes());
+                pos
+            }
             ReferenceValueLeaf::F64(num) => write_into(&mut self.node_data, num),
             ReferenceValueLeaf::Bool(b) => b as u32,
             ReferenceValueLeaf::Date(date) => {
-                write_into(&mut self.node_data, date.into_timestamp_nanos())
+                let pos = self.node_data.len() as u32;
+                self.node_data
+                    .extend_from_slice(&date.into_timestamp_nanos().to_le_bytes());
+                pos
             }
-            ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
+            ReferenceValueLeaf::IpAddr(num) => {
+                let pos = self.node_data.len() as u32;
+                self.node_data
+                    .extend_from_slice(&num.to_u128().to_le_bytes());
+                pos
+            }
             ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
         };
         ValueAddr { type_id, val_addr }
     }
-    /// Adds a value and returns in address into the
+
+    /// Returns a streaming value writer that encodes nested arrays and objects directly into
+    /// `node_data` using a caller-owned reusable `scratch` buffer without materializing an
+    /// intermediate DOM.
+    #[inline]
+    pub fn value_writer_with_scratch<'a, 's>(
+        &'a mut self,
+        scratch: &'s mut Vec<u8>,
+    ) -> CompactDocValueWriter<'a, 's> {
+        scratch.clear();
+        CompactDocValueWriter { doc: self, scratch }
+    }
+
+    /// Adds a value and returns its address in `node_data`.
     fn add_value<'a, V: Value<'a>>(&mut self, value: V) -> ValueAddr {
         let value = value.as_value();
+        match value {
+            ReferenceValue::Leaf(leaf) => self.add_value_leaf(leaf),
+            other => {
+                let mut scratch: SmallVec<[u8; 512]> = SmallVec::new();
+                self.add_ref_value_with_scratch(other, &mut scratch)
+            }
+        }
+    }
+
+    /// Recursively encodes a value into `node_data`, using `scratch` as a LIFO buffer for child
+    /// address tables so nested arrays/objects do not allocate per node.
+    fn add_ref_value_with_scratch<'a, V: Value<'a>>(
+        &mut self,
+        value: ReferenceValue<'a, V>,
+        scratch: &mut SmallVec<[u8; 512]>,
+    ) -> ValueAddr {
         let type_id = ValueType::from(&value);
         match value {
             ReferenceValue::Leaf(leaf) => self.add_value_leaf(leaf),
             ReferenceValue::Array(elements) => {
-                // addresses of the elements in node_data
-                // Reusing a vec would be nicer, but it's not easy because of the recursion
-                // A global vec would work if every writer get it's discriminator
-                let mut addresses = Vec::new();
+                let start = scratch.len();
                 for elem in elements {
-                    let value_addr = self.add_value(elem);
-                    write_into(&mut addresses, value_addr);
+                    let value_addr = self.add_ref_value_with_scratch(elem.as_value(), scratch);
+                    write_fixed_value_addr_smallvec(scratch, value_addr);
                 }
-                ValueAddr {
-                    type_id,
-                    val_addr: write_bytes_into(&mut self.node_data, &addresses),
-                }
+                let val_addr = write_bytes_into(&mut self.node_data, &scratch[start..]);
+                scratch.truncate(start);
+                ValueAddr { type_id, val_addr }
             }
             ReferenceValue::Object(entries) => {
-                // addresses of the elements in node_data
-                let mut addresses = Vec::new();
-                for (key, value) in entries {
-                    let key_addr = self.add_value_leaf(ReferenceValueLeaf::Str(key));
-                    let value_addr = self.add_value(value);
-                    write_into(&mut addresses, key_addr);
-                    write_into(&mut addresses, value_addr);
+                let start = scratch.len();
+                for (key, val) in entries {
+                    let key_val_addr = write_bytes_into(&mut self.node_data, key.as_bytes());
+                    let value_addr = self.add_ref_value_with_scratch(val.as_value(), scratch);
+                    let entry = encode_object_entry(key_val_addr, value_addr);
+                    scratch.extend_from_slice(&entry);
                 }
-                ValueAddr {
-                    type_id,
-                    val_addr: write_bytes_into(&mut self.node_data, &addresses),
-                }
+                let val_addr = write_bytes_into(&mut self.node_data, &scratch[start..]);
+                scratch.truncate(start);
+                ValueAddr { type_id, val_addr }
             }
         }
     }
 
     /// Get CompactDocValue for address
+    #[inline(always)]
     fn get_compact_doc_value(&self, value_addr: ValueAddr) -> CompactDocValue<'_> {
         CompactDocValue {
             container: self,
@@ -318,11 +365,13 @@ impl CompactDoc {
     }
 
     /// get &[u8] reference from node_data
+    #[inline(always)]
     fn extract_bytes(&self, addr: Addr) -> &[u8] {
         binary_deserialize_bytes(self.get_slice(addr))
     }
 
     /// get &str reference from node_data
+    #[inline(always)]
     fn extract_str(&self, addr: Addr) -> &str {
         let data = self.extract_bytes(addr);
         // Utf-8 checks would have a noticeable performance overhead here.
@@ -331,7 +380,22 @@ impl CompactDoc {
         unsafe { std::str::from_utf8_unchecked(data) }
     }
 
+    /// Read a little-endian `u64` directly from `node_data` without `io::Cursor` overhead.
+    #[inline(always)]
+    fn read_u64(&self, addr: Addr) -> u64 {
+        let start = addr as usize;
+        u64::from_le_bytes(self.node_data[start..start + 8].try_into().unwrap())
+    }
+
+    /// Read a little-endian `u128` directly from `node_data` without `io::Cursor` overhead.
+    #[inline(always)]
+    fn read_u128(&self, addr: Addr) -> u128 {
+        let start = addr as usize;
+        u128::from_le_bytes(self.node_data[start..start + 16].try_into().unwrap())
+    }
+
     /// deserialized owned value from node_data
+    #[inline]
     fn read_from<T: BinarySerializable>(&self, addr: Addr) -> io::Result<T> {
         let data_slice = &self.node_data[addr as usize..];
         let mut cursor = std::io::Cursor::new(data_slice);
@@ -339,25 +403,90 @@ impl CompactDoc {
     }
 
     /// get slice from address. The returned slice is open ended
+    #[inline(always)]
     fn get_slice(&self, addr: Addr) -> &[u8] {
         &self.node_data[addr as usize..]
     }
 }
 
 /// BinarySerializable alternative to read references
+#[inline(always)]
 fn binary_deserialize_bytes(data: &[u8]) -> &[u8] {
-    let (len, bytes_read) = read_u32_vint_no_advance(data);
-    &data[bytes_read..bytes_read + len as usize]
+    let first = data[0];
+    if first >= 0x80 {
+        let len = (first & 0x7f) as usize;
+        &data[1..1 + len]
+    } else {
+        let (len, bytes_read) = read_u32_vint_no_advance(data);
+        &data[bytes_read..bytes_read + len as usize]
+    }
+}
+
+/// Fixed encoded byte width of a [`ValueAddr`] inside `CompactDoc`'s in-memory `node_data`.
+const VALUE_ADDR_ENCODED_SIZE: usize = 5;
+/// Fixed encoded byte width of an object `(key_addr: u32, value_addr: ValueAddr)` entry.
+const OBJECT_ENTRY_ENCODED_SIZE: usize = 4 + VALUE_ADDR_ENCODED_SIZE;
+
+#[inline(always)]
+fn encode_value_addr(addr: ValueAddr) -> [u8; VALUE_ADDR_ENCODED_SIZE] {
+    let bytes = addr.val_addr.to_le_bytes();
+    [addr.type_id as u8, bytes[0], bytes[1], bytes[2], bytes[3]]
+}
+
+#[inline(always)]
+fn encode_object_entry(key_addr: u32, addr: ValueAddr) -> [u8; OBJECT_ENTRY_ENCODED_SIZE] {
+    let key_bytes = key_addr.to_le_bytes();
+    let val_bytes = addr.val_addr.to_le_bytes();
+    [
+        key_bytes[0],
+        key_bytes[1],
+        key_bytes[2],
+        key_bytes[3],
+        addr.type_id as u8,
+        val_bytes[0],
+        val_bytes[1],
+        val_bytes[2],
+        val_bytes[3],
+    ]
+}
+
+#[inline(always)]
+fn write_fixed_value_addr_smallvec(buf: &mut SmallVec<[u8; 512]>, addr: ValueAddr) {
+    buf.extend_from_slice(&encode_value_addr(addr));
+}
+
+#[inline(always)]
+fn read_fixed_value_addr(bytes: &[u8]) -> Option<ValueAddr> {
+    if bytes.len() < VALUE_ADDR_ENCODED_SIZE {
+        return None;
+    }
+    let type_byte = bytes[0];
+    if type_byte > 13 {
+        return None;
+    }
+    // SAFETY: `type_byte` is checked to be in `0..=13`, matching `ValueType`'s repr(u8) variants.
+    let type_id = unsafe { std::mem::transmute::<u8, ValueType>(type_byte) };
+    let val_addr = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    Some(ValueAddr { type_id, val_addr })
 }
 
 /// Write bytes and return the position of the written data.
 ///
 /// BinarySerializable alternative to write references
+#[inline]
 fn write_bytes_into(vec: &mut Vec<u8>, data: &[u8]) -> u32 {
     let pos = vec.len() as u32;
-    let mut buf = [0u8; 8];
-    let len_vint_bytes = serialize_vint_u32(data.len() as u32, &mut buf);
-    vec.extend_from_slice(len_vint_bytes);
+    let len = data.len();
+    if len < 128 {
+        vec.reserve(1 + len);
+        // Tantivy VInt sets the high bit (0x80) on the final byte.
+        vec.push((len as u8) | 0x80);
+    } else {
+        let mut buf = [0u8; 8];
+        let len_vint_bytes = serialize_vint_u32(len as u32, &mut buf);
+        vec.reserve(len_vint_bytes.len() + len);
+        vec.extend_from_slice(len_vint_bytes);
+    }
     vec.extend_from_slice(data);
     pos
 }
@@ -428,11 +557,13 @@ impl<'a> Value<'a> for CompactDocValue<'a> {
 
     type ObjectIter = CompactDocObjectIter<'a>;
 
+    #[inline]
     fn as_value(&self) -> ReferenceValue<'a, Self> {
         self.get_ref_value().unwrap()
     }
 }
 impl<'a> CompactDocValue<'a> {
+    #[inline(always)]
     fn get_ref_value(&self) -> io::Result<ReferenceValue<'a, CompactDocValue<'a>>> {
         let addr = self.value_addr.val_addr;
         match self.value_addr.type_id {
@@ -453,32 +584,22 @@ impl<'a> CompactDocValue<'a> {
                 let data = self.container.extract_bytes(addr);
                 Ok(ReferenceValueLeaf::Custom(data).into())
             }
-            ValueType::U64 => self
-                .container
-                .read_from::<u64>(addr)
-                .map(ReferenceValueLeaf::U64)
-                .map(Into::into),
-            ValueType::I64 => self
-                .container
-                .read_from::<i64>(addr)
-                .map(ReferenceValueLeaf::I64)
-                .map(Into::into),
-            ValueType::F64 => self
-                .container
-                .read_from::<f64>(addr)
-                .map(ReferenceValueLeaf::F64)
-                .map(Into::into),
+            ValueType::U64 => Ok(ReferenceValueLeaf::U64(self.container.read_u64(addr)).into()),
+            ValueType::I64 => {
+                Ok(ReferenceValueLeaf::I64(self.container.read_u64(addr) as i64).into())
+            }
+            ValueType::F64 => {
+                Ok(ReferenceValueLeaf::F64(f64::from_bits(self.container.read_u64(addr))).into())
+            }
             ValueType::Bool => Ok(ReferenceValueLeaf::Bool(addr != 0).into()),
-            ValueType::Date => self
-                .container
-                .read_from::<i64>(addr)
-                .map(|ts| ReferenceValueLeaf::Date(DateTime::from_timestamp_nanos(ts)))
-                .map(Into::into),
-            ValueType::IpAddr => self
-                .container
-                .read_from::<u128>(addr)
-                .map(|num| ReferenceValueLeaf::IpAddr(Ipv6Addr::from_u128(num)))
-                .map(Into::into),
+            ValueType::Date => {
+                let ts = self.container.read_u64(addr) as i64;
+                Ok(ReferenceValueLeaf::Date(DateTime::from_timestamp_nanos(ts)).into())
+            }
+            ValueType::IpAddr => {
+                let num = self.container.read_u128(addr);
+                Ok(ReferenceValueLeaf::IpAddr(Ipv6Addr::from_u128(num)).into())
+            }
             ValueType::PreTokStr => self
                 .container
                 .read_from::<PreTokenizedString>(addr)
@@ -494,6 +615,106 @@ impl<'a> CompactDocValue<'a> {
                 addr,
             )?)),
         }
+    }
+}
+
+/// Opaque handle to a value encoded inside a [`CompactDoc`]'s `node_data` buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct CompactDocValueAddr(ValueAddr);
+
+/// Streaming encoder that writes nested JSON/document values straight into a [`CompactDoc`]
+/// using a caller-owned LIFO `Vec<u8>` scratch buffer, avoiding any intermediate DOM allocation
+/// or per-document stack/heap scratch setup.
+pub struct CompactDocValueWriter<'a, 's> {
+    doc: &'a mut CompactDoc,
+    scratch: &'s mut Vec<u8>,
+}
+
+impl CompactDocValueWriter<'_, '_> {
+    /// Returns a mutable reference to the underlying [`CompactDoc`] for adding top-level
+    /// leaf fields while a dynamic object is being accumulated in `scratch`.
+    #[inline(always)]
+    pub fn doc_mut(&mut self) -> &mut CompactDoc {
+        self.doc
+    }
+
+    /// Encodes a leaf value into `node_data` and returns its address.
+    #[inline(always)]
+    pub fn write_leaf(&mut self, leaf: ReferenceValueLeaf<'_>) -> CompactDocValueAddr {
+        CompactDocValueAddr(self.doc.add_value_leaf(leaf))
+    }
+
+    /// Encodes an object key string into `node_data` and returns its byte offset.
+    #[inline(always)]
+    pub fn write_key(&mut self, key: &str) -> u32 {
+        write_bytes_into(&mut self.doc.node_data, key.as_bytes())
+    }
+
+    /// Starts encoding an object into the LIFO scratch buffer and returns its frame marker.
+    #[inline(always)]
+    pub fn begin_object(&self) -> usize {
+        self.scratch.len()
+    }
+
+    /// Appends a `(key_addr, val_addr)` entry to the currently open object frame.
+    #[inline(always)]
+    pub fn push_object_entry(&mut self, key_addr: u32, val_addr: CompactDocValueAddr) {
+        let entry = encode_object_entry(key_addr, val_addr.0);
+        self.scratch.extend_from_slice(&entry);
+    }
+
+    /// Finalizes the object frame started at `start` and returns its encoded address.
+    #[inline(always)]
+    pub fn end_object(&mut self, start: usize) -> CompactDocValueAddr {
+        let val_addr = write_bytes_into(&mut self.doc.node_data, &self.scratch[start..]);
+        self.scratch.truncate(start);
+        CompactDocValueAddr(ValueAddr {
+            type_id: ValueType::Object,
+            val_addr,
+        })
+    }
+
+    /// Returns whether any entries have been written into the object/array frame starting at
+    /// `start`.
+    #[inline(always)]
+    pub fn frame_is_empty(&self, start: usize) -> bool {
+        self.scratch.len() == start
+    }
+
+    /// Starts encoding an array into the LIFO scratch buffer and returns its frame marker.
+    #[inline(always)]
+    pub fn begin_array(&self) -> usize {
+        self.scratch.len()
+    }
+
+    /// Appends an element address to the currently open array frame.
+    #[inline(always)]
+    pub fn push_array_elem(&mut self, val_addr: CompactDocValueAddr) {
+        let entry = encode_value_addr(val_addr.0);
+        self.scratch.extend_from_slice(&entry);
+    }
+
+    /// Finalizes the array frame started at `start` and returns its encoded address.
+    #[inline(always)]
+    pub fn end_array(&mut self, start: usize) -> CompactDocValueAddr {
+        let val_addr = write_bytes_into(&mut self.doc.node_data, &self.scratch[start..]);
+        self.scratch.truncate(start);
+        CompactDocValueAddr(ValueAddr {
+            type_id: ValueType::Array,
+            val_addr,
+        })
+    }
+
+    /// Attaches an encoded value address as a top-level field value on the document.
+    #[inline(always)]
+    pub fn finish_field(&mut self, field: Field, addr: CompactDocValueAddr) {
+        self.doc.field_values.push(FieldValueAddr {
+            field: field
+                .field_id()
+                .try_into()
+                .expect("support only up to u16::MAX field ids"),
+            value_addr: addr.0,
+        });
     }
 }
 
@@ -636,20 +857,33 @@ impl<'a> CompactDocObjectIter<'a> {
 impl<'a> Iterator for CompactDocObjectIter<'a> {
     type Item = (&'a str, CompactDocValue<'a>);
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.node_addresses_slice.is_empty() {
+        if self.node_addresses_slice.len() < OBJECT_ENTRY_ENCODED_SIZE {
             return None;
         }
-        let key_addr = ValueAddr::deserialize(&mut self.node_addresses_slice).ok()?;
-        let key = self.container.extract_str(key_addr.val_addr);
-        let value = ValueAddr::deserialize(&mut self.node_addresses_slice).ok()?;
+        let (entry, rest) = self
+            .node_addresses_slice
+            .split_at(OBJECT_ENTRY_ENCODED_SIZE);
+        self.node_addresses_slice = rest;
+        let key_addr = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        let key = self.container.extract_str(key_addr);
+        let value_addr = read_fixed_value_addr(&entry[4..])?;
         let value = CompactDocValue {
             container: self.container,
-            value_addr: value,
+            value_addr,
         };
         Some((key, value))
     }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.node_addresses_slice.len() / OBJECT_ENTRY_ENCODED_SIZE;
+        (remaining, Some(remaining))
+    }
 }
+
+impl ExactSizeIterator for CompactDocObjectIter<'_> {}
 
 #[derive(Debug, Clone)]
 /// The Iterator for the array values in the compact document
@@ -660,7 +894,7 @@ pub struct CompactDocArrayIter<'a> {
 
 impl<'a> CompactDocArrayIter<'a> {
     fn new(container: &'a CompactDoc, addr: Addr) -> io::Result<Self> {
-        // Arrays are &[ValueAddr] serialized into bytes
+        // Arrays are fixed-width `ValueAddr` entries serialized into bytes
         let node_addresses_slice = container.extract_bytes(addr);
         Ok(Self {
             container,
@@ -672,18 +906,29 @@ impl<'a> CompactDocArrayIter<'a> {
 impl<'a> Iterator for CompactDocArrayIter<'a> {
     type Item = CompactDocValue<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.node_addresses_slice.is_empty() {
+        if self.node_addresses_slice.len() < VALUE_ADDR_ENCODED_SIZE {
             return None;
         }
-        let value = ValueAddr::deserialize(&mut self.node_addresses_slice).ok()?;
+        let (entry, rest) = self.node_addresses_slice.split_at(VALUE_ADDR_ENCODED_SIZE);
+        self.node_addresses_slice = rest;
+        let value_addr = read_fixed_value_addr(entry)?;
         let value = CompactDocValue {
             container: self.container,
-            value_addr: value,
+            value_addr,
         };
         Some(value)
     }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.node_addresses_slice.len() / VALUE_ADDR_ENCODED_SIZE;
+        (remaining, Some(remaining))
+    }
 }
+
+impl ExactSizeIterator for CompactDocArrayIter<'_> {}
 
 impl Document for CompactDoc {
     type Value<'a> = CompactDocValue<'a>;

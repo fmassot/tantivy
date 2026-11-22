@@ -7,7 +7,7 @@ use common::{CountingWriter, OwnedBytes};
 use zstd::bulk::Compressor;
 
 use super::value::ValueWriter;
-use super::{BlockReader, value, vint};
+use super::{value, vint, BlockReader};
 
 const FOUR_BIT_LIMITS: usize = 1 << 4;
 const VINT_MODE: u8 = 1u8;
@@ -94,6 +94,8 @@ where W: io::Write
     value_writer: TValueWriter,
     // Only here to avoid allocations.
     stateless_buffer: Vec<u8>,
+    #[cfg(feature = "zstd-compression")]
+    zstd_compressor: Option<Compressor<'static>>,
     block_len: usize,
 }
 
@@ -108,6 +110,8 @@ where
             write: CountingWriter::wrap(BufWriter::new(wrt)),
             value_writer: TValueWriter::default(),
             stateless_buffer: Vec::new(),
+            #[cfg(feature = "zstd-compression")]
+            zstd_compressor: None,
             block_len: BLOCK_LEN,
         }
     }
@@ -136,7 +140,11 @@ where
 
                 let max_len = zstd::zstd_safe::compress_bound(buffer.len());
                 self.block.reserve(max_len);
-                Compressor::new(3)?.compress_to_buffer(buffer, &mut self.block)?;
+                let compressor = match self.zstd_compressor.as_mut() {
+                    Some(compressor) => compressor,
+                    None => self.zstd_compressor.insert(Compressor::new(3)?),
+                };
+                compressor.compress_to_buffer(buffer, &mut self.block)?;
 
                 // verify compression had a positive impact
                 if self.block.len() < buffer.len() {

@@ -127,6 +127,15 @@ where
         }
     }
 
+    /// Advance the stream and return the next value without materializing the key.
+    pub fn next_without_key(&mut self) -> Option<&TermInfo> {
+        if self.advance() {
+            Some(self.value())
+        } else {
+            None
+        }
+    }
+
     /// Returns the `TermOrdinal` of the given term.
     ///
     /// May panic if the called as `.advance()` as never
