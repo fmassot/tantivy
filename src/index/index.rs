@@ -20,7 +20,8 @@ use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_L
 use crate::error::{DataCorruption, TantivyError};
 use crate::fastfield::FastFieldsPlugin;
 use crate::index::{
-    IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta, SegmentMetaInventory,
+    IndexMeta, IndexMetaSnapshot, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta,
+    SegmentMetaInventory,
 };
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
@@ -646,6 +647,54 @@ impl Index {
         self.inventory.new_segment_meta(segment_id, max_doc)
     }
 
+    /// Loads and deserializes `meta.json` from `directory` into a reusable [`IndexMetaSnapshot`].
+    pub fn load_meta_snapshot(directory: &dyn Directory) -> crate::Result<IndexMetaSnapshot> {
+        let meta_data = directory.atomic_read(&META_FILEPATH)?;
+        let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
+            error!("Meta data is not valid utf8.");
+            DataCorruption::new(
+                META_FILEPATH.to_path_buf(),
+                "Meta file does not contain valid utf8 file.".to_string(),
+            )
+        })?;
+        IndexMetaSnapshot::deserialize(&meta_string)
+            .map_err(|e| {
+                DataCorruption::new(
+                    META_FILEPATH.to_path_buf(),
+                    format!("Meta file cannot be deserialized. {e:?}. Content: {meta_string:?}"),
+                )
+            })
+            .map_err(From::from)
+    }
+
+    /// Opens an index using a pre-parsed [`IndexMetaSnapshot`], skipping `meta.json`
+    /// deserialization.
+    ///
+    /// Hidden contract: `snapshot` must have been loaded from an identical, immutable copy of
+    /// `directory`.
+    pub fn open_with_meta_snapshot<T: Into<Box<dyn Directory>>>(
+        directory: T,
+        snapshot: &IndexMetaSnapshot,
+    ) -> crate::Result<Index> {
+        let directory = directory.into();
+        let directory = ManagedDirectory::wrap(directory)?;
+        let inventory = SegmentMetaInventory::default();
+        let metas = snapshot.track(&inventory);
+        let index = Index::open_from_metas(directory, &metas, inventory);
+        Ok(index)
+    }
+
+    pub(crate) fn searchable_segments_from_snapshot(
+        &self,
+        snapshot: &IndexMetaSnapshot,
+    ) -> Vec<Segment> {
+        snapshot
+            .searchable_segment_metas(&self.inventory)
+            .into_iter()
+            .map(|segment_meta| self.segment(segment_meta))
+            .collect()
+    }
+
     /// Open the index using the provided directory
     pub fn open<T: Into<Box<dyn Directory>>>(directory: T) -> crate::Result<Index> {
         let directory = directory.into();
@@ -940,5 +989,35 @@ impl Index {
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Index({:?})", self.directory)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::schema::{Schema, TEXT};
+
+    #[test]
+    fn test_open_and_reader_with_meta_snapshot() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let body = schema_builder.add_text_field("body", TEXT);
+        let schema = schema_builder.build();
+        let dir = crate::directory::RamDirectory::create();
+        let index = Index::create(dir.clone(), schema, IndexSettings::default())?;
+        let mut writer = index.writer_for_tests()?;
+        writer.add_document(doc!(body => "alpha beta"))?;
+        writer.add_document(doc!(body => "gamma delta"))?;
+        writer.commit()?;
+
+        let snapshot = Index::load_meta_snapshot(&dir)?;
+        let reopened = Index::open_with_meta_snapshot(dir, &snapshot)?;
+        let reader = reopened
+            .reader_builder()
+            .reload_policy(crate::ReloadPolicy::Manual)
+            .try_into_with_meta_snapshot(&snapshot)?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 2);
+        assert_eq!(reopened.schema(), index.schema());
+        Ok(())
     }
 }

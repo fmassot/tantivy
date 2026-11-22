@@ -229,8 +229,8 @@ pub use self::docset::{DocSet, SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN, TERMI
 pub use crate::core::{json_utils, Executor, Searcher, SearcherGeneration};
 pub use crate::directory::Directory;
 pub use crate::index::{
-    Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
-    Segment, SegmentMeta, SegmentReader,
+    Index, IndexBuilder, IndexMeta, IndexMetaSnapshot, IndexSettings, IndexSortByField,
+    InvertedIndexReader, Order, Segment, SegmentMeta, SegmentReader,
 };
 pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 pub use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
