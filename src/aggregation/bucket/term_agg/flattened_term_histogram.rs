@@ -365,8 +365,9 @@ struct FlattenedTermHistogramCollector<R: BucketResolver, const LANES: usize> {
     /// `bucket_pos` mapped to time-bucket index 0.
     base_pos: i64,
     terms_req_data: TermsAggReqData,
-    /// The terms full column's values
-    terms_values: Arc<dyn ColumnValues>,
+    /// The terms full column's values (Some when Full; None when Optional, falling back to
+    /// `terms_req_data.accessor` which returns aligned `(docids, vals)`).
+    terms_values_full: Option<Arc<dyn ColumnValues>>,
     /// Histogram collector without any bucket. It is only used to produce the histogram
     /// intermediate results, once filled from `counts`.
     intermediate_result_histogram_collector: SegmentHistogramCollector<(), false>,
@@ -454,9 +455,24 @@ impl<R: BucketResolver, const LANES: usize> SegmentAggregationCollector
 
         // The term column is always needed. The resolver fetches the histogram column only when
         // bucket selection depends on its values; `SingleBucketResolver` makes this a no-op.
-        self.term_block
-            .fetch_full_column_block(docs, &*self.terms_values);
-        self.bucket_resolver.prepare_block(docs);
+        if let Some(terms_values) = &self.terms_values_full {
+            self.term_block
+                .fetch_full_column_block(docs, &**terms_values);
+            self.bucket_resolver.prepare_block(docs);
+        } else {
+            // Optional terms column (with `missing == None`): `term_block.docids()` yields the
+            // exact non-null doc ids aligned 1:1 with `term_block.iter_vals()`.
+            self.term_block.fetch_block_with_missing(
+                docs,
+                &mut *self.terms_req_data.accessor,
+                None,
+            );
+            let matched_docs = self.term_block.docids();
+            if matched_docs.is_empty() {
+                return Ok(());
+            }
+            self.bucket_resolver.prepare_block(matched_docs);
+        }
 
         // Keep separate bounded and unbounded entry points so the common path has no bounds branch,
         // while the computed resolver can retain a direct hard-bounds loop without materializing an
@@ -502,7 +518,7 @@ impl<R: BucketResolver, const LANES: usize> SegmentAggregationCollector
 /// The resolved inputs of the flattened terms×histogram collector, computed by
 /// [`plan_flattened_collector`].
 pub(super) struct TermHistogramFlattenedPlanInputs {
-    terms_values: Arc<dyn ColumnValues>,
+    terms_values_full: Option<Arc<dyn ColumnValues>>,
     hist_values: Arc<dyn ColumnValues>,
     num_terms: usize,
     range: DenseRange,
@@ -555,12 +571,17 @@ pub(super) fn plan_flattened_collector(
         return None;
     }
 
-    // Check fullness once, here, and hand the bare values array downstream.
-    let terms_values = try_get_column_full_values(&*terms_req_data.accessor)?;
+    // Terms column may be Full or Optional (when `missing` is unset, since we skip missing docs).
+    // Multivalued columns cannot use the 1-to-1 flattened zip without deduplication.
+    let terms_col = terms_req_data.accessor.as_physical_column()?;
+    let terms_values_full = match terms_col.get_cardinality() {
+        Cardinality::Full => Some(terms_col.values.clone()),
+        Cardinality::Optional if terms_req_data.missing_value_for_accessor.is_none() => None,
+        _ => return None,
+    };
     // The flat counters are `u32`, bumped once per value, so no count can exceed the
-    // column's value count. (Essentially always true here: the column is full, so its
-    // value count equals the doc count, and `DocId` is `u32`.)
-    if terms_values.num_vals() == u32::MAX {
+    // column's value count.
+    if terms_col.values.num_vals() == u32::MAX {
         return None;
     }
     // Get the dense bucket range of the (already normalized) histogram request; only take the
@@ -582,7 +603,7 @@ pub(super) fn plan_flattened_collector(
         return None;
     }
     Some(TermHistogramFlattenedPlanInputs {
-        terms_values,
+        terms_values_full,
         hist_values,
         num_terms,
         range,
@@ -619,7 +640,7 @@ pub(super) fn build_flattened_collector_from_plan(
         ));
     };
     let TermHistogramFlattenedPlanInputs {
-        terms_values,
+        terms_values_full,
         hist_values,
         num_terms,
         range,
@@ -630,7 +651,7 @@ pub(super) fn build_flattened_collector_from_plan(
             agg_data,
             terms_req_data,
             hist_req_data,
-            terms_values,
+            terms_values_full,
             hist_values,
             num_terms,
             range,
@@ -640,7 +661,7 @@ pub(super) fn build_flattened_collector_from_plan(
             agg_data,
             terms_req_data,
             hist_req_data,
-            terms_values,
+            terms_values_full,
             hist_values,
             num_terms,
             range,
@@ -661,7 +682,7 @@ fn build_flattened_collector<const LANES: usize>(
     agg_data: &mut AggregationsSegmentCtx,
     terms_req_data: TermsAggReqData,
     hist_req_data: HistogramAggReqData,
-    terms_values: Arc<dyn ColumnValues>,
+    terms_values_full: Option<Arc<dyn ColumnValues>>,
     hist_values: Arc<dyn ColumnValues>,
     num_terms: usize,
     range: DenseRange,
@@ -677,7 +698,7 @@ fn build_flattened_collector<const LANES: usize>(
         return build_flattened_collector_with_resolver::<SingleBucketResolver, LANES>(
             agg_data,
             terms_req_data,
-            terms_values,
+            terms_values_full,
             hist_req_data,
             num_terms,
             base_pos,
@@ -694,7 +715,7 @@ fn build_flattened_collector<const LANES: usize>(
             return build_flattened_collector_with_resolver::<_, LANES>(
                 agg_data,
                 terms_req_data,
-                terms_values,
+                terms_values_full,
                 hist_req_data,
                 num_terms,
                 base_pos,
@@ -711,7 +732,7 @@ fn build_flattened_collector<const LANES: usize>(
             return build_flattened_collector_with_resolver::<_, LANES>(
                 agg_data,
                 terms_req_data,
-                terms_values,
+                terms_values_full,
                 hist_req_data,
                 num_terms,
                 base_pos,
@@ -729,7 +750,7 @@ fn build_flattened_collector<const LANES: usize>(
     build_flattened_collector_with_resolver::<_, LANES>(
         agg_data,
         terms_req_data,
-        terms_values,
+        terms_values_full,
         hist_req_data,
         num_terms,
         base_pos,
@@ -740,7 +761,7 @@ fn build_flattened_collector<const LANES: usize>(
 fn build_flattened_collector_with_resolver<R: BucketResolver, const LANES: usize>(
     agg_data: &mut AggregationsSegmentCtx,
     terms_req_data: TermsAggReqData,
-    terms_values: Arc<dyn ColumnValues<u64>>,
+    terms_values_full: Option<Arc<dyn ColumnValues<u64>>>,
     hist_req_data: HistogramAggReqData,
     num_terms: usize,
     base_pos: i64,
@@ -770,7 +791,7 @@ fn build_flattened_collector_with_resolver<R: BucketResolver, const LANES: usize
         counts,
         base_pos,
         terms_req_data,
-        terms_values,
+        terms_values_full,
         intermediate_result_histogram_collector: SegmentHistogramCollector::from_dense_rows(
             hist_req_data,
         ),

@@ -250,6 +250,12 @@ impl ColumnBlockAccessor {
         &self.val_cache
     }
 
+    /// Returns mutable access to the internal value scratch buffer.
+    #[inline]
+    pub(crate) fn values_mut_for_scratch(&mut self) -> &mut Vec<u64> {
+        &mut self.val_cache
+    }
+
     /// Returns the document IDs corresponding to [`Self::values`] for a non-full column.
     #[inline]
     pub(crate) fn docids(&self) -> &[DocId] {

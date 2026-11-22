@@ -176,7 +176,8 @@ impl SelectCursor<RowId> for OptionalIndexSelectCursor<'_> {
 impl Set<RowId> for OptionalIndex {
     type SelectCursor<'b>
         = OptionalIndexSelectCursor<'b>
-    where Self: 'b;
+    where
+        Self: 'b;
     // Check if value at position is not null.
     #[inline]
     fn contains(&self, row_id: RowId) -> bool {
@@ -433,15 +434,11 @@ impl Block<'_> {
     fn rank_if_exists_batch(
         self,
         doc_ids: impl Iterator<Item = u16>,
-        mut collect: impl FnMut(u16, u16),
+        collect: impl FnMut(u16, u16),
     ) {
         match self {
             Block::Dense(dense_block) => {
-                for doc_id in doc_ids {
-                    if let Some(row_id) = dense_block.rank_if_exists(doc_id) {
-                        collect(doc_id, row_id);
-                    }
-                }
+                dense_block.rank_if_exists_batch(doc_ids, collect);
             }
             Block::Sparse(sparse_block) => {
                 sparse_block.rank_if_exists_batch(doc_ids, collect);

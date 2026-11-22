@@ -124,7 +124,8 @@ impl SelectCursor<u16> for DenseBlockSelectCursor<'_> {
 impl<'a> Set<u16> for DenseBlock<'a> {
     type SelectCursor<'b>
         = DenseBlockSelectCursor<'a>
-    where Self: 'b;
+    where
+        Self: 'b;
 
     #[inline(always)]
     fn contains(&self, el: u16) -> bool {
@@ -175,6 +176,39 @@ impl<'a> Set<u16> for DenseBlock<'a> {
 }
 
 impl DenseBlock<'_> {
+    /// Batched `rank_if_exists` for ascending `doc_ids`, caching the 64-doc mini-block across
+    /// consecutive docs and taking a branch-free path when a mini-block is completely full or empty.
+    #[inline]
+    pub fn rank_if_exists_batch(
+        self,
+        doc_ids: impl Iterator<Item = u16>,
+        mut collect: impl FnMut(u16, u16),
+    ) {
+        let mut cached_block_pos: u16 = u16::MAX;
+        let mut cached_bitvec: u64 = 0;
+        let mut cached_rank: u16 = 0;
+
+        for doc_id in doc_ids {
+            let block_pos = doc_id >> 6;
+            if block_pos != cached_block_pos {
+                cached_block_pos = block_pos;
+                let mini = self.mini_block(block_pos);
+                cached_bitvec = mini.bitvec;
+                cached_rank = mini.rank;
+            }
+            if cached_bitvec == 0 {
+                continue;
+            }
+            let pos = doc_id & 63;
+            if cached_bitvec == u64::MAX {
+                collect(doc_id, cached_rank + pos);
+            } else if (cached_bitvec & (1u64 << pos)) != 0 {
+                let ones = rank_u64(cached_bitvec, pos);
+                collect(doc_id, cached_rank + ones);
+            }
+        }
+    }
+
     #[inline]
     fn mini_block(&self, mini_block_id: u16) -> DenseMiniBlock {
         let data_start_pos = mini_block_id as usize * MINI_BLOCK_NUM_BYTES;

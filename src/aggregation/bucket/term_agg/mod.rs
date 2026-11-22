@@ -1059,6 +1059,68 @@ impl<TermMap: TermAggregationMap, B: SubAggBuffer> SegmentAggregationCollector
 
         let req_data = &mut self.terms_req_data;
 
+        // Fast path for contiguous doc ranges (e.g. MatchAll, range queries, dense runs) on an
+        // Optional physical column with no sub-aggregations: translate the entire doc range with
+        // just 2 `rank()` calls instead of per-doc `docids_to_rowids`, decode values contiguously
+        // via `get_range`, and count missing docs in O(1).
+        if self.sub_agg.is_none() && !docs.is_empty() {
+            let first_doc = docs[0];
+            let last_doc = docs[docs.len() - 1];
+            if last_doc.wrapping_sub(first_doc) + 1 == docs.len() as u32 {
+                if let Some(column) = req_data.accessor.as_physical_column() {
+                    if matches!(&column.index, columnar::ColumnIndex::Optional(_)) {
+                        let row_range = column.index.docid_range_to_rowids(first_doc..last_doc + 1);
+                        let non_null_len = (row_range.end - row_range.start) as usize;
+                        let term_buckets = &mut self.parent_buckets[parent_bucket_id as usize];
+                        if non_null_len > 0 {
+                            let val_buf = agg_data.column_block_accessor.values_mut_for_scratch();
+                            val_buf.resize(non_null_len, 0u64);
+                            column.values.get_range(row_range.start as u64, val_buf);
+                            if let Some(allowed_bs) = req_data.allowed_term_ids.as_ref() {
+                                Self::collect_terms(
+                                    val_buf
+                                        .iter()
+                                        .copied()
+                                        .filter(move |&term_id| allowed_bs.contains(term_id as u32)),
+                                    term_buckets,
+                                    &mut self.bucket_id_provider,
+                                );
+                            } else {
+                                Self::collect_terms(
+                                    val_buf.iter().copied(),
+                                    term_buckets,
+                                    &mut self.bucket_id_provider,
+                                );
+                            }
+                        }
+                        let missing_count = docs.len() - non_null_len;
+                        if missing_count > 0 {
+                            if let Some(missing_val) = req_data.missing_value_for_accessor {
+                                let allowed = req_data
+                                    .allowed_term_ids
+                                    .as_ref()
+                                    .is_none_or(|bs| bs.contains(missing_val as u32));
+                                if allowed {
+                                    for _ in 0..missing_count {
+                                        term_buckets
+                                            .term_entry(missing_val, &mut self.bucket_id_provider);
+                                    }
+                                }
+                            }
+                        }
+                        let mem_delta = self.get_memory_consumption(parent_bucket_id) - mem_pre;
+                        if mem_delta > 0 {
+                            agg_data
+                                .context
+                                .limits
+                                .add_memory_consumed(mem_delta as u64)?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         agg_data
             .column_block_accessor
             .fetch_block_with_missing_unique_per_doc(
@@ -1291,48 +1353,118 @@ where
                 }
             }
             OrderTarget::SubAggregation(sub_agg_path) => {
-                // Peek segment-level metric values, select top-k, then fall through to
-                // `cut_off_buckets`. Like Elasticsearch, we always cut off when ordering
-                // by a sub-agg: top-K results are approximate and may differ from the
-                // global ordering, especially for non-monotonic metrics like avg/min.
                 let coll = sub_agg_collector.as_deref().ok_or_else(|| {
                     TantivyError::InvalidArgument(format!(
                         "Could not find sub-aggregation collector for path {sub_agg_path}"
                     ))
                 })?;
                 let (agg_name, agg_prop) = get_agg_name_and_property(sub_agg_path);
-                // Fetch values up-front; otherwise sort would re-compute per call
-                let mut keyed: Vec<_> = entries
-                    .into_iter()
-                    .map(|bucket| {
-                        // Reached only when ordering by a sub-agg, i.e. sub aggregations exist and
-                        // the slot is a real `BucketId`, so `to_bucket_id` never hits
-                        // `unreachable!`.
-                        let metric_value = coll
+                let is_desc = term_req.req.order.order == Order::Desc;
+
+                // When keeping only a small top-K out of many buckets (e.g. high-cardinality
+                // `terms` ordered by `min(timestamp)` with `size: 3`), maintain a bounded binary
+                // heap of size `segment_size` in a single pass instead of allocating two full
+                // `Vec`s of all buckets and running `select_nth_unstable_by`.
+                if segment_size == 0 {
+                    let sum_other: u64 = entries.iter().map(|(_, b)| b.count as u64).sum();
+                    entries.clear();
+                    total_doc_count = Some(sum_other);
+                } else if entries.len() > segment_size.saturating_mul(2) {
+                    #[derive(Clone, Copy)]
+                    struct HeapEntry<Slot: BucketIdSlot> {
+                        metric: f64,
+                        raw_key: u64,
+                        bucket: Bucket<Slot>,
+                        is_desc: bool,
+                    }
+                    impl<Slot: BucketIdSlot> PartialEq for HeapEntry<Slot> {
+                        fn eq(&self, other: &Self) -> bool {
+                            self.metric.to_bits() == other.metric.to_bits()
+                        }
+                    }
+                    impl<Slot: BucketIdSlot> Eq for HeapEntry<Slot> {}
+                    impl<Slot: BucketIdSlot> PartialOrd for HeapEntry<Slot> {
+                        #[inline]
+                        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                            Some(self.cmp(other))
+                        }
+                    }
+                    impl<Slot: BucketIdSlot> Ord for HeapEntry<Slot> {
+                        #[inline]
+                        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                            if self.is_desc {
+                                other
+                                    .metric
+                                    .partial_cmp(&self.metric)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            } else {
+                                self.metric
+                                    .partial_cmp(&other.metric)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            }
+                        }
+                    }
+
+                    let mut total_docs: u64 = 0;
+                    let mut heap: std::collections::BinaryHeap<HeapEntry<TermMap::Slot>> =
+                        std::collections::BinaryHeap::with_capacity(segment_size + 1);
+                    for (raw_key, bucket) in entries {
+                        total_docs += bucket.count as u64;
+                        let metric = coll
                             .compute_metric_value(
-                                bucket.1.bucket_id.to_bucket_id(),
+                                bucket.bucket_id.to_bucket_id(),
                                 agg_name,
                                 agg_prop,
                                 agg_data,
                             )
                             .unwrap_or(0.0);
-                        (metric_value, bucket)
-                    })
-                    .collect();
-                if keyed.len() > segment_size {
-                    // there are situations where sort_unstable might be advantageous, but
-                    // detecting them isn't trivial, and these situation should be rare.
-                    if term_req.req.order.order == Order::Desc {
-                        keyed.select_nth_unstable_by(segment_size, |a, b| {
-                            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                    } else {
-                        keyed.select_nth_unstable_by(segment_size, |a, b| {
-                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                        let candidate = HeapEntry {
+                            metric,
+                            raw_key,
+                            bucket,
+                            is_desc,
+                        };
+                        if heap.len() < segment_size {
+                            heap.push(candidate);
+                        } else if let Some(mut top) = heap.peek_mut() {
+                            if candidate < *top {
+                                *top = candidate;
+                            }
+                        }
                     }
+                    entries = Vec::with_capacity(heap.len());
+                    for item in heap {
+                        entries.push((item.raw_key, item.bucket));
+                    }
+                    total_doc_count = Some(total_docs);
+                } else {
+                    let mut keyed: Vec<_> = entries
+                        .into_iter()
+                        .map(|bucket| {
+                            let metric_value = coll
+                                .compute_metric_value(
+                                    bucket.1.bucket_id.to_bucket_id(),
+                                    agg_name,
+                                    agg_prop,
+                                    agg_data,
+                                )
+                                .unwrap_or(0.0);
+                            (metric_value, bucket)
+                        })
+                        .collect();
+                    if keyed.len() > segment_size {
+                        if is_desc {
+                            keyed.select_nth_unstable_by(segment_size, |a, b| {
+                                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                        } else {
+                            keyed.select_nth_unstable_by(segment_size, |a, b| {
+                                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                        }
+                    }
+                    entries = keyed.into_iter().map(|(_, e)| e).collect();
                 }
-                entries = keyed.into_iter().map(|(_, e)| e).collect();
             }
             OrderTarget::Count => {
                 if entries.len() > segment_size {
