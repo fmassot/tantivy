@@ -87,6 +87,53 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
             self.block.clear();
         }
     }
+
+    fn collect_slice(&mut self, values: &[u64]) {
+        if values.is_empty() {
+            return;
+        }
+        if !self.block.is_empty() {
+            for &val in values {
+                self.collect(val);
+            }
+            return;
+        }
+        let block_len = BLOCK_SIZE as usize;
+        let num_blocks = values.len().div_ceil(block_len);
+        // Sample up to 16 evenly-spaced 512-element blocks when the column is large to avoid
+        // running floating-point least-squares regression on hundreds of blocks per column.
+        const MAX_SAMPLED_BLOCKS: usize = 16;
+        if num_blocks <= MAX_SAMPLED_BLOCKS * 2 {
+            for chunk in values.chunks(block_len) {
+                self.block.clear();
+                self.block.extend_from_slice(chunk);
+                self.flush_block_estimate();
+            }
+            self.block.clear();
+        } else {
+            let stride = num_blocks / MAX_SAMPLED_BLOCKS;
+            let mut sampled_rows = 0u64;
+            let mut sampled_blocks = 0u64;
+            let mut block_idx = 0usize;
+            while block_idx < num_blocks && (sampled_blocks as usize) < MAX_SAMPLED_BLOCKS {
+                let start = block_idx * block_len;
+                let end = (start + block_len).min(values.len());
+                self.block.clear();
+                self.block.extend_from_slice(&values[start..end]);
+                self.flush_block_estimate();
+                sampled_rows += (end - start) as u64;
+                sampled_blocks += 1;
+                block_idx += stride;
+            }
+            self.block.clear();
+            if sampled_rows > 0 && sampled_blocks > 0 {
+                self.values_num_bytes =
+                    self.values_num_bytes.saturating_mul(values.len() as u64) / sampled_rows;
+                self.meta_num_bytes =
+                    self.meta_num_bytes.saturating_mul(num_blocks as u64) / sampled_blocks;
+            }
+        }
+    }
     fn estimate(&self, stats: &ColumnStats) -> Option<u64> {
         let mut estimate = 4 + stats.num_bytes() + self.meta_num_bytes + self.values_num_bytes;
         if stats.gcd.get() > 1 {

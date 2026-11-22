@@ -37,6 +37,13 @@ pub trait ColumnCodecEstimator<T = u64>: 'static {
     /// This method will be called for each element of the column during
     /// `estimation`.
     fn collect(&mut self, value: u64);
+    /// Batch version of [`Self::collect`] over a contiguous slice, avoiding per-element virtual
+    /// dispatch when the input values are already materialized in memory.
+    fn collect_slice(&mut self, values: &[u64]) {
+        for &value in values {
+            self.collect(value);
+        }
+    }
     /// Finalizes the first pass phase.
     fn finalize(&mut self) {}
     /// Returns an accurate estimation of the number of bytes that will
@@ -50,6 +57,18 @@ pub trait ColumnCodecEstimator<T = u64>: 'static {
         vals: &mut dyn Iterator<Item = T>,
         wrt: &mut dyn io::Write,
     ) -> io::Result<()>;
+    /// Slice-based serialization fast path avoiding `dyn Iterator` dispatch per element.
+    fn serialize_slice(
+        &self,
+        stats: &ColumnStats,
+        vals: &[u64],
+        wrt: &mut dyn io::Write,
+    ) -> io::Result<()>
+    where
+        T: From<u64>,
+    {
+        self.serialize(stats, &mut vals.iter().copied().map(T::from), wrt)
+    }
 }
 
 /// A column codec describes a column serialization format.
@@ -145,6 +164,50 @@ impl CodecType {
             CodecType::BlockwiseLinear => BlockwiseLinearCodec::boxed_estimator(),
         }
     }
+}
+
+/// Serializes a contiguous slice of already-mapped `u64` column values without `dyn Iterator`
+/// virtual dispatch or redundant passes.
+pub(crate) fn serialize_u64_based_column_values_slice(
+    values: &[u64],
+    codec_types: &[CodecType],
+    wrt: &mut dyn Write,
+) -> io::Result<()> {
+    let mut stats_collector = StatsCollector::default();
+    stats_collector.collect_slice(values);
+    let stats = stats_collector.stats();
+
+    // Fast path: constant or 1-bit columns cannot be beat by blockwise codecs (whose block
+    // headers exceed 0-1 bit/val), so emit Bitpacked directly without running other estimators.
+    let bitpacked_bits = tantivy_bitpacker::compute_num_bits(stats.amplitude() / stats.gcd);
+    let has_bitpacked = codec_types.contains(&CodecType::Bitpacked);
+    if has_bitpacked && bitpacked_bits <= 1 {
+        CodecType::Bitpacked.to_code().serialize(wrt)?;
+        return BitpackedCodec::estimator().serialize_slice(&stats, values, wrt);
+    }
+
+    let mut estimators: Vec<(CodecType, Box<dyn ColumnCodecEstimator>)> =
+        Vec::with_capacity(codec_types.len());
+    for &codec_type in codec_types {
+        let mut estimator = codec_type.estimator();
+        estimator.collect_slice(values);
+        estimator.finalize();
+        estimators.push((codec_type, estimator));
+    }
+
+    let (_, best_codec, best_codec_estimator) = estimators
+        .into_iter()
+        .flat_map(|(codec_type, estimator)| {
+            let num_bytes = estimator.estimate(&stats)?;
+            Some((num_bytes, codec_type, estimator))
+        })
+        .min_by_key(|(num_bytes, _, _)| *num_bytes)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "No available applicable codec.")
+        })?;
+    best_codec.to_code().serialize(wrt)?;
+    best_codec_estimator.serialize_slice(&stats, values, wrt)?;
+    Ok(())
 }
 
 /// Serializes a given column of u64-mapped values.

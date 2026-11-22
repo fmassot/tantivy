@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use common::{BinarySerializable, OwnedBytes};
 use fastdivide::DividerU64;
-use tantivy_bitpacker::{BitPacker, BitUnpacker, compute_num_bits};
+use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
 use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 use crate::{ColumnValues, MonotonicallyMappableToU64, RowId};
@@ -23,7 +23,11 @@ const fn div_ceil(n: u64, q: NonZeroU64) -> u64 {
     // copied from unstable rust standard library.
     let d = n / q.get();
     let r = n % q.get();
-    if r > 0 { d + 1 } else { d }
+    if r > 0 {
+        d + 1
+    } else {
+        d
+    }
 }
 
 // The bitpacked codec applies a linear transformation `f` over data that are bitpacked.
@@ -80,6 +84,45 @@ impl<const NUM_BITS: u8> ColumnValues for BitpackedReader<NUM_BITS> {
             }
         }
     }
+
+    fn get_vals_opt(&self, indexes: &[u32], output: &mut [Option<u64>]) {
+        assert_eq!(indexes.len(), output.len());
+        let len = indexes.len();
+        if len >= 4 {
+            let first = indexes[0];
+            if indexes[len - 1] == first.wrapping_add((len - 1) as u32)
+                && indexes
+                    .iter()
+                    .enumerate()
+                    .all(|(idx, &doc)| doc == first.wrapping_add(idx as u32))
+            {
+                let mut buf = [0u64; 64];
+                let mut offset = 0usize;
+                while offset < len {
+                    let take = (len - offset).min(64);
+                    self.get_range(first as u64 + offset as u64, &mut buf[..take]);
+                    for (out_slot, &val) in
+                        output[offset..offset + take].iter_mut().zip(&buf[..take])
+                    {
+                        *out_slot = Some(val);
+                    }
+                    offset += take;
+                }
+                return;
+            }
+        }
+        let (out_chunks, out_rem) = output.as_chunks_mut::<4>();
+        let (idx_chunks, idx_rem) = indexes.as_chunks::<4>();
+        for (out_x4, idx_x4) in out_chunks.iter_mut().zip(idx_chunks) {
+            out_x4[0] = Some(self.get_val(idx_x4[0]));
+            out_x4[1] = Some(self.get_val(idx_x4[1]));
+            out_x4[2] = Some(self.get_val(idx_x4[2]));
+            out_x4[3] = Some(self.get_val(idx_x4[3]));
+        }
+        for (out, idx) in out_rem.iter_mut().zip(idx_rem) {
+            *out = Some(self.get_val(*idx));
+        }
+    }
     #[inline]
     fn min_value(&self) -> u64 {
         self.stats.min_value
@@ -124,6 +167,8 @@ pub struct BitpackedCodecEstimator;
 impl ColumnCodecEstimator for BitpackedCodecEstimator {
     fn collect(&mut self, _value: u64) {}
 
+    fn collect_slice(&mut self, _values: &[u64]) {}
+
     fn estimate(&self, stats: &ColumnStats) -> Option<u64> {
         let num_bits_per_value = num_bits(stats);
         Some(stats.num_bytes() + (stats.num_rows as u64 * (num_bits_per_value as u64)).div_ceil(8))
@@ -137,10 +182,47 @@ impl ColumnCodecEstimator for BitpackedCodecEstimator {
     ) -> io::Result<()> {
         stats.serialize(wrt)?;
         let num_bits = num_bits(stats);
+        if num_bits == 0 {
+            return Ok(());
+        }
         let mut bit_packer = BitPacker::new();
-        let divider = DividerU64::divide_by(stats.gcd.get());
-        for val in vals {
-            bit_packer.write(divider.divide(val - stats.min_value), num_bits, wrt)?;
+        let min_value = stats.min_value;
+        if stats.gcd.get() == 1 {
+            for val in vals {
+                bit_packer.write(val - min_value, num_bits, wrt)?;
+            }
+        } else {
+            let divider = DividerU64::divide_by(stats.gcd.get());
+            for val in vals {
+                bit_packer.write(divider.divide(val - min_value), num_bits, wrt)?;
+            }
+        }
+        bit_packer.close(wrt)?;
+        Ok(())
+    }
+
+    fn serialize_slice(
+        &self,
+        stats: &ColumnStats,
+        vals: &[u64],
+        wrt: &mut dyn Write,
+    ) -> io::Result<()> {
+        stats.serialize(wrt)?;
+        let num_bits = num_bits(stats);
+        if num_bits == 0 {
+            return Ok(());
+        }
+        let mut bit_packer = BitPacker::new();
+        let min_value = stats.min_value;
+        if stats.gcd.get() == 1 {
+            for &val in vals {
+                bit_packer.write(val - min_value, num_bits, wrt)?;
+            }
+        } else {
+            let divider = DividerU64::divide_by(stats.gcd.get());
+            for &val in vals {
+                bit_packer.write(divider.divide(val - min_value), num_bits, wrt)?;
+            }
         }
         bit_packer.close(wrt)?;
         Ok(())

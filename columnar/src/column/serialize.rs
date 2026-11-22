@@ -64,6 +64,22 @@ pub fn serialize_column_mappable_to_u64<T: MonotonicallyMappableToU64>(
     Ok(())
 }
 
+/// Slice-specialized variant of [`serialize_column_mappable_to_u64`] for pre-mapped `u64` slices.
+pub(crate) fn serialize_column_u64_slice(
+    column_index: SerializableColumnIndex<'_>,
+    column_values: &[u64],
+    output: &mut impl Write,
+) -> io::Result<()> {
+    let column_index_num_bytes = serialize_column_index(column_index, output)?;
+    crate::column_values::serialize_u64_based_column_values_slice(
+        column_values,
+        &[CodecType::Bitpacked, CodecType::BlockwiseLinear],
+        output,
+    )?;
+    output.write_all(&column_index_num_bytes.to_le_bytes())?;
+    Ok(())
+}
+
 pub fn open_column_u64<T: MonotonicallyMappableToU64>(
     bytes: OwnedBytes,
     format_version: Version,

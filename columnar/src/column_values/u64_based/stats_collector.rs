@@ -90,6 +90,40 @@ impl StatsCollector {
         self.num_rows += 1;
         self.update_increment_gcd(value);
     }
+
+    /// Collects statistics over a contiguous slice of `u64` values.
+    ///
+    /// Once `gcd == 1` (true after the first few elements on most columns), switches to a tight
+    /// branch-free `min`/`max` loop that auto-vectorizes cleanly.
+    pub fn collect_slice(&mut self, values: &[u64]) {
+        if values.is_empty() {
+            return;
+        }
+        let mut idx = 0usize;
+        while idx < values.len() {
+            let value = values[idx];
+            self.collect(value);
+            idx += 1;
+            if let Some((gcd, _)) = self.increment_gcd_opt
+                && gcd.get() == 1
+            {
+                break;
+            }
+        }
+        if idx < values.len() {
+            let (mut min_val, mut max_val) = self.min_max_opt.unwrap();
+            for &value in &values[idx..] {
+                if value < min_val {
+                    min_val = value;
+                }
+                if value > max_val {
+                    max_val = value;
+                }
+            }
+            self.min_max_opt = Some((min_val, max_val));
+            self.num_rows += (values.len() - idx) as RowId;
+        }
+    }
 }
 
 #[cfg(test)]
