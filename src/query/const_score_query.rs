@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
+use common::TinySet;
+
+use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, COLLECT_BLOCK_BUFFER_LEN};
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
@@ -140,6 +142,26 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
 
     fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
         self.docset.fill_buffer(buffer)
+    }
+
+    fn fill_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        self.docset.fill_bitset_block(min_doc, mask)
+    }
+
+    fn for_each_no_score(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        callback: &mut dyn FnMut(&[DocId]),
+    ) {
+        self.docset.for_each_no_score(buffer, callback)
+    }
+
+    fn count_including_deleted(&mut self) -> u32 {
+        self.docset.count_including_deleted()
     }
 
     fn doc(&self) -> DocId {

@@ -138,7 +138,7 @@ pub trait Weight: Send + Sync + 'static {
         let mut docset = self.scorer(reader, 1.0)?;
 
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        for_each_docset_buffered(&mut docset, &mut buffer, callback);
+        docset.for_each_no_score(&mut buffer, callback);
         Ok(())
     }
 

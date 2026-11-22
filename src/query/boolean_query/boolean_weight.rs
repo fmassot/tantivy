@@ -1,17 +1,17 @@
 use std::cmp::Ordering;
 
 use super::occur_weights::OccurWeights;
-use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
+use crate::docset::{DocSet, SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::postings::FreqReadingOption;
 use crate::query::disjunction::Disjunction;
 use crate::query::explanation::does_not_match;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::term_query::TermScorer;
-use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
+use crate::query::weight::{for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
-    intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
-    RequiredOptionalScorer, Scorer, Weight,
+    intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation,
+    Intersection, Occur, RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score, TERMINATED};
 
@@ -642,23 +642,28 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             SpecializedScorer::TermUnion(mut term_scorers) => {
                 if term_scorers.len() == 1 {
                     let mut term_scorer = term_scorers.pop().unwrap();
-                    for_each_docset_buffered(&mut term_scorer, &mut buffer, callback);
+                    term_scorer.for_each_no_score(&mut buffer, callback);
                 } else {
                     let mut union_scorer =
                         BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
-                    for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+                    union_scorer.for_each_no_score(&mut buffer, callback);
                 }
             }
-            SpecializedScorer::TermIntersection(term_scorers) => {
-                let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
-                    .into_iter()
-                    .map(|term_scorer| Box::new(term_scorer) as Box<dyn Scorer>)
-                    .collect();
-                let mut intersection = intersect_scorers(boxed_scorers, num_docs);
-                for_each_docset_buffered(intersection.as_mut(), &mut buffer, callback);
+            SpecializedScorer::TermIntersection(mut term_scorers) => {
+                if term_scorers.is_empty() {
+                    // Nothing matches.
+                } else if term_scorers.len() == 1 {
+                    let mut term_scorer = term_scorers.pop().unwrap();
+                    term_scorer.for_each_no_score(&mut buffer, callback);
+                } else {
+                    // Use unboxed `Intersection<TermScorer, TermScorer>` so 3+ term intersections
+                    // avoid dynamic dispatch on every block and inline `fill_bitset_block`.
+                    let mut intersection = Intersection::new(term_scorers, num_docs);
+                    intersection.for_each_no_score(&mut buffer, callback);
+                }
             }
             SpecializedScorer::Other(mut scorer) => {
-                for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
+                scorer.for_each_no_score(&mut buffer, callback);
             }
         }
         Ok(())

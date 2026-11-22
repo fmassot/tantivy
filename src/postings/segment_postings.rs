@@ -1,6 +1,6 @@
-use common::HasLen;
+use common::{HasLen, TinySet};
 
-use crate::docset::DocSet;
+use crate::docset::{DocSet, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
 use crate::positions::PositionReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
@@ -153,6 +153,34 @@ impl SegmentPostings {
     }
 }
 
+/// Sets all bits in `[start..=end_inclusive]` within a 1024-doc bitset block.
+///
+/// Precondition: `start <= end_inclusive < BLOCK_WINDOW`.
+#[inline]
+fn set_bit_range(mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS], start: u32, end_inclusive: u32) {
+    debug_assert!(start <= end_inclusive);
+    debug_assert!(end_inclusive < BLOCK_WINDOW);
+    let start_word = (start >> 6) as usize;
+    let end_word = (end_inclusive >> 6) as usize;
+    let start_bit = start & 63;
+    let end_bit = end_inclusive & 63;
+    let start_mask = TinySet::range_greater_or_equal(start_bit);
+    let end_mask = if end_bit == 63 {
+        TinySet::full()
+    } else {
+        TinySet::range_lower(end_bit + 1)
+    };
+    if start_word == end_word {
+        mask[start_word] = mask[start_word].union(start_mask.intersect(end_mask));
+    } else {
+        mask[start_word] = mask[start_word].union(start_mask);
+        for word in &mut mask[start_word + 1..end_word] {
+            *word = TinySet::full();
+        }
+        mask[end_word] = mask[end_word].union(end_mask);
+    }
+}
+
 impl DocSet for SegmentPostings {
     // goes to the next element.
     // next needs to be called a first time to point to the correct element.
@@ -188,6 +216,100 @@ impl DocSet for SegmentPostings {
         let doc = self.doc();
         debug_assert!(doc >= target);
         doc
+    }
+
+    #[inline]
+    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
+        if self.doc() == TERMINATED {
+            return 0;
+        }
+        let mut filled = 0usize;
+        while filled < COLLECT_BLOCK_BUFFER_LEN {
+            let block = self.block_cursor.docs();
+            if self.cur >= block.len() {
+                if block.len() < COMPRESSION_BLOCK_SIZE {
+                    return filled;
+                }
+                self.cur = 0;
+                self.block_cursor.advance();
+                continue;
+            }
+            let remaining = &block[self.cur..];
+            let take = remaining.len().min(COLLECT_BLOCK_BUFFER_LEN - filled);
+            buffer[filled..filled + take].copy_from_slice(&remaining[..take]);
+            self.cur += take;
+            filled += take;
+        }
+        if self.cur == COMPRESSION_BLOCK_SIZE {
+            self.cur = 0;
+            self.block_cursor.advance();
+        }
+        filled
+    }
+
+    #[inline]
+    fn fill_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        if self.doc() < min_doc {
+            self.seek(min_doc);
+        }
+        let horizon = min_doc.saturating_add(BLOCK_WINDOW).min(TERMINATED);
+        loop {
+            let block = self.block_cursor.docs();
+            if self.cur >= block.len() {
+                if block.len() < COMPRESSION_BLOCK_SIZE {
+                    return TERMINATED;
+                }
+                self.cur = 0;
+                self.block_cursor.advance();
+                continue;
+            }
+            let first_doc = block[self.cur];
+            if first_doc >= horizon {
+                return first_doc;
+            }
+            let last_doc = block[block.len() - 1];
+            let run_len = (block.len() - self.cur) as u32;
+            if last_doc < horizon {
+                if last_doc - first_doc == run_len - 1 {
+                    set_bit_range(mask, first_doc - min_doc, last_doc - min_doc);
+                } else {
+                    for &doc in &block[self.cur..] {
+                        let delta = doc - min_doc;
+                        mask[(delta >> 6) as usize].insert_mut(delta & 63);
+                    }
+                }
+                if block.len() < COMPRESSION_BLOCK_SIZE {
+                    self.cur = block.len();
+                    return TERMINATED;
+                }
+                self.cur = 0;
+                self.block_cursor.advance();
+            } else {
+                if last_doc - first_doc == run_len - 1 {
+                    let count = horizon - first_doc;
+                    set_bit_range(mask, first_doc - min_doc, horizon - 1 - min_doc);
+                    self.cur += count as usize;
+                    return block[self.cur];
+                }
+                let mut idx = self.cur;
+                while idx < block.len() {
+                    let doc = block[idx];
+                    if doc >= horizon {
+                        self.cur = idx;
+                        return doc;
+                    }
+                    let delta = doc - min_doc;
+                    mask[(delta >> 6) as usize].insert_mut(delta & 63);
+                    idx += 1;
+                }
+                self.cur = block.len();
+                return TERMINATED;
+            }
+        }
     }
 
     /// Return the current document's `DocId`.
