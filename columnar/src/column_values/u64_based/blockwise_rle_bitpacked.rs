@@ -198,6 +198,41 @@ impl ColumnCodecEstimator for BlockwiseRleBitpackedEstimator {
         }
     }
 
+    fn collect_slice(&mut self, values: &[u64]) {
+        if self.cur_len != 0 {
+            for &val in values {
+                self.collect(val);
+            }
+            return;
+        }
+        let block_len = BLOCK_SIZE as usize;
+        self.summaries.reserve(values.len().div_ceil(block_len));
+        for chunk in values.chunks(block_len) {
+            let first = chunk[0];
+            let mut prev = first;
+            let mut min_val = first;
+            let mut max_val = first;
+            let mut num_runs = 1u16;
+            for &val in &chunk[1..] {
+                if val != prev {
+                    prev = val;
+                    num_runs += 1;
+                    if val < min_val {
+                        min_val = val;
+                    }
+                    if val > max_val {
+                        max_val = val;
+                    }
+                }
+            }
+            self.summaries.push(BlockSummary {
+                min_raw: min_val,
+                range_raw: max_val - min_val,
+                num_runs,
+            });
+        }
+    }
+
     fn finalize(&mut self) {
         self.flush_current_block();
     }

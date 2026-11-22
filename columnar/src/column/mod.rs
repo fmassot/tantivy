@@ -12,7 +12,7 @@ use common::BinarySerializable;
 pub use dictionary_encoded::{BytesColumn, StrColumn};
 #[cfg(feature = "plain_codec")]
 pub use plain::{PlainBytesColumn, PlainStrColumn, PlainValueReader};
-pub(crate) use serialize::serialize_generated_tie_breaker_column;
+pub(crate) use serialize::{serialize_column_u64_slice, serialize_generated_tie_breaker_column};
 pub use serialize::{
     open_column_bytes, open_column_str, open_column_u64, open_column_u128,
     open_column_u128_as_compact_u64, serialize_column_mappable_to_u64,

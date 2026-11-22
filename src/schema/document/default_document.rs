@@ -380,6 +380,20 @@ impl CompactDoc {
         unsafe { std::str::from_utf8_unchecked(data) }
     }
 
+    /// Read a little-endian `u64` directly from `node_data` without `io::Cursor` overhead.
+    #[inline(always)]
+    fn read_u64(&self, addr: Addr) -> u64 {
+        let start = addr as usize;
+        u64::from_le_bytes(self.node_data[start..start + 8].try_into().unwrap())
+    }
+
+    /// Read a little-endian `u128` directly from `node_data` without `io::Cursor` overhead.
+    #[inline(always)]
+    fn read_u128(&self, addr: Addr) -> u128 {
+        let start = addr as usize;
+        u128::from_le_bytes(self.node_data[start..start + 16].try_into().unwrap())
+    }
+
     /// deserialized owned value from node_data
     #[inline]
     fn read_from<T: BinarySerializable>(&self, addr: Addr) -> io::Result<T> {
@@ -549,7 +563,7 @@ impl<'a> Value<'a> for CompactDocValue<'a> {
     }
 }
 impl<'a> CompactDocValue<'a> {
-    #[inline]
+    #[inline(always)]
     fn get_ref_value(&self) -> io::Result<ReferenceValue<'a, CompactDocValue<'a>>> {
         let addr = self.value_addr.val_addr;
         match self.value_addr.type_id {
@@ -570,32 +584,22 @@ impl<'a> CompactDocValue<'a> {
                 let data = self.container.extract_bytes(addr);
                 Ok(ReferenceValueLeaf::Custom(data).into())
             }
-            ValueType::U64 => self
-                .container
-                .read_from::<u64>(addr)
-                .map(ReferenceValueLeaf::U64)
-                .map(Into::into),
-            ValueType::I64 => self
-                .container
-                .read_from::<i64>(addr)
-                .map(ReferenceValueLeaf::I64)
-                .map(Into::into),
-            ValueType::F64 => self
-                .container
-                .read_from::<f64>(addr)
-                .map(ReferenceValueLeaf::F64)
-                .map(Into::into),
+            ValueType::U64 => Ok(ReferenceValueLeaf::U64(self.container.read_u64(addr)).into()),
+            ValueType::I64 => {
+                Ok(ReferenceValueLeaf::I64(self.container.read_u64(addr) as i64).into())
+            }
+            ValueType::F64 => {
+                Ok(ReferenceValueLeaf::F64(f64::from_bits(self.container.read_u64(addr))).into())
+            }
             ValueType::Bool => Ok(ReferenceValueLeaf::Bool(addr != 0).into()),
-            ValueType::Date => self
-                .container
-                .read_from::<i64>(addr)
-                .map(|ts| ReferenceValueLeaf::Date(DateTime::from_timestamp_nanos(ts)))
-                .map(Into::into),
-            ValueType::IpAddr => self
-                .container
-                .read_from::<u128>(addr)
-                .map(|num| ReferenceValueLeaf::IpAddr(Ipv6Addr::from_u128(num)))
-                .map(Into::into),
+            ValueType::Date => {
+                let ts = self.container.read_u64(addr) as i64;
+                Ok(ReferenceValueLeaf::Date(DateTime::from_timestamp_nanos(ts)).into())
+            }
+            ValueType::IpAddr => {
+                let num = self.container.read_u128(addr);
+                Ok(ReferenceValueLeaf::IpAddr(Ipv6Addr::from_u128(num)).into())
+            }
             ValueType::PreTokStr => self
                 .container
                 .read_from::<PreTokenizedString>(addr)

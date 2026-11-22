@@ -167,6 +167,8 @@ pub struct BitpackedCodecEstimator;
 impl ColumnCodecEstimator for BitpackedCodecEstimator {
     fn collect(&mut self, _value: u64) {}
 
+    fn collect_slice(&mut self, _values: &[u64]) {}
+
     fn estimate(&self, stats: &ColumnStats) -> Option<u64> {
         let num_bits_per_value = num_bits(stats);
         Some(stats.num_bytes() + (stats.num_rows as u64 * (num_bits_per_value as u64)).div_ceil(8))
@@ -180,10 +182,47 @@ impl ColumnCodecEstimator for BitpackedCodecEstimator {
     ) -> io::Result<()> {
         stats.serialize(wrt)?;
         let num_bits = num_bits(stats);
+        if num_bits == 0 {
+            return Ok(());
+        }
         let mut bit_packer = BitPacker::new();
-        let divider = DividerU64::divide_by(stats.gcd.get());
-        for val in vals {
-            bit_packer.write(divider.divide(val - stats.min_value), num_bits, wrt)?;
+        let min_value = stats.min_value;
+        if stats.gcd.get() == 1 {
+            for val in vals {
+                bit_packer.write(val - min_value, num_bits, wrt)?;
+            }
+        } else {
+            let divider = DividerU64::divide_by(stats.gcd.get());
+            for val in vals {
+                bit_packer.write(divider.divide(val - min_value), num_bits, wrt)?;
+            }
+        }
+        bit_packer.close(wrt)?;
+        Ok(())
+    }
+
+    fn serialize_slice(
+        &self,
+        stats: &ColumnStats,
+        vals: &[u64],
+        wrt: &mut dyn Write,
+    ) -> io::Result<()> {
+        stats.serialize(wrt)?;
+        let num_bits = num_bits(stats);
+        if num_bits == 0 {
+            return Ok(());
+        }
+        let mut bit_packer = BitPacker::new();
+        let min_value = stats.min_value;
+        if stats.gcd.get() == 1 {
+            for &val in vals {
+                bit_packer.write(val - min_value, num_bits, wrt)?;
+            }
+        } else {
+            let divider = DividerU64::divide_by(stats.gcd.get());
+            for &val in vals {
+                bit_packer.write(divider.divide(val - min_value), num_bits, wrt)?;
+            }
         }
         bit_packer.close(wrt)?;
         Ok(())

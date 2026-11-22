@@ -5,11 +5,23 @@ use crate::{ColumnValues, RowId};
 
 pub trait Iterable<T = u64> {
     fn boxed_iter(&self) -> Box<dyn Iterator<Item = T> + '_>;
+
+    /// Returns the underlying contiguous slice when available, enabling zero-virtual-dispatch
+    /// passes during columnar serialization.
+    #[inline]
+    fn as_slice(&self) -> Option<&[T]> {
+        None
+    }
 }
 
 impl<T: Copy> Iterable<T> for &[T] {
     fn boxed_iter(&self) -> Box<dyn Iterator<Item = T> + '_> {
         Box::new(self.iter().copied())
+    }
+
+    #[inline]
+    fn as_slice(&self) -> Option<&[T]> {
+        Some(self)
     }
 }
 

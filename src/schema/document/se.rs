@@ -69,6 +69,33 @@ where W: Write
     }
 }
 
+#[inline(always)]
+fn push_field_and_u64(out: &mut Vec<u8>, field_id: u32, code: u8, val: u64) {
+    let f = field_id.to_le_bytes();
+    let b = val.to_le_bytes();
+    out.extend_from_slice(&[
+        f[0], f[1], f[2], f[3], code, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]);
+}
+
+#[inline(always)]
+fn push_field_and_bytes(out: &mut Vec<u8>, field_id: u32, code: u8, bytes: &[u8]) {
+    let f = field_id.to_le_bytes();
+    let len = bytes.len();
+    if len < 128 {
+        out.reserve(6 + len);
+        out.extend_from_slice(&[f[0], f[1], f[2], f[3], code, (len as u8) | 0x80]);
+        out.extend_from_slice(bytes);
+    } else {
+        let mut vint_buf = [0u8; 8];
+        let len_bytes = common::serialize_vint_u32(len as u32, &mut vint_buf);
+        out.reserve(5 + len_bytes.len() + len);
+        out.extend_from_slice(&[f[0], f[1], f[2], f[3], code]);
+        out.extend_from_slice(len_bytes);
+        out.extend_from_slice(bytes);
+    }
+}
+
 /// Fast single-pass document serializer directly into a `&mut Vec<u8>`.
 ///
 /// Avoids the double iteration over `doc.iter_fields_and_values()` and per-write `io::Result`
@@ -80,25 +107,85 @@ pub(crate) fn serialize_doc_to_vec<D: Document>(
     schema: &Schema,
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
+    let iter = doc.iter_fields_and_values();
+    let (size_hint, _) = iter.size_hint();
+    if size_hint > 0 {
+        out.reserve(1 + size_hint.saturating_mul(14));
+    }
     let count_pos = out.len();
     // Reserve 1 byte for the common case (< 128 stored field values).
     out.push(0);
     let mut num_field_values: usize = 0;
 
-    for (field, value_access) in doc.iter_fields_and_values() {
+    for (field, value_access) in iter {
         if !schema.get_field_entry(field).is_stored() {
             continue;
         }
-        out.extend_from_slice(&field.field_id().to_le_bytes());
+        let field_id = field.field_id();
         match value_access.as_value() {
-            ReferenceValue::Leaf(ReferenceValueLeaf::PreTokStr(pre_tokenized_text)) => {
-                push_bytes_with_type_code(
-                    out,
-                    type_codes::TEXT_CODE,
-                    pre_tokenized_text.text.as_bytes(),
-                );
+            ReferenceValue::Leaf(leaf) => match leaf {
+                ReferenceValueLeaf::Str(val) => {
+                    push_field_and_bytes(out, field_id, type_codes::TEXT_CODE, val.as_bytes());
+                }
+                ReferenceValueLeaf::I64(val) => {
+                    push_field_and_u64(out, field_id, type_codes::I64_CODE, val as u64);
+                }
+                ReferenceValueLeaf::U64(val) => {
+                    push_field_and_u64(out, field_id, type_codes::U64_CODE, val);
+                }
+                ReferenceValueLeaf::F64(val) => {
+                    push_field_and_u64(out, field_id, type_codes::F64_CODE, f64_to_u64(val));
+                }
+                ReferenceValueLeaf::Date(val) => {
+                    push_field_and_u64(
+                        out,
+                        field_id,
+                        type_codes::DATE_CODE,
+                        val.into_timestamp_nanos() as u64,
+                    );
+                }
+                ReferenceValueLeaf::Bool(val) => {
+                    let f = field_id.to_le_bytes();
+                    out.extend_from_slice(&[f[0], f[1], f[2], f[3], type_codes::BOOL_CODE, val as u8]);
+                }
+                ReferenceValueLeaf::Null => {
+                    let f = field_id.to_le_bytes();
+                    out.extend_from_slice(&[f[0], f[1], f[2], f[3], type_codes::NULL_CODE]);
+                }
+                ReferenceValueLeaf::Bytes(val) => {
+                    push_field_and_bytes(out, field_id, type_codes::BYTES_CODE, val);
+                }
+                ReferenceValueLeaf::Facet(val) => {
+                    push_field_and_bytes(
+                        out,
+                        field_id,
+                        type_codes::HIERARCHICAL_FACET_CODE,
+                        val.as_bytes(),
+                    );
+                }
+                ReferenceValueLeaf::PreTokStr(pre_tokenized_text) => {
+                    push_field_and_bytes(
+                        out,
+                        field_id,
+                        type_codes::TEXT_CODE,
+                        pre_tokenized_text.text.as_bytes(),
+                    );
+                }
+                ReferenceValueLeaf::IpAddr(val) => {
+                    let f = field_id.to_le_bytes();
+                    out.extend_from_slice(&[f[0], f[1], f[2], f[3], type_codes::IP_CODE]);
+                    out.extend_from_slice(&val.to_u128().to_le_bytes());
+                }
+                ReferenceValueLeaf::Custom(_) => {
+                    return Err(io::Error::other(
+                        "the store does not support custom field types",
+                    ));
+                }
+            },
+            val => {
+                out.extend_from_slice(&field_id.to_le_bytes());
+                serialize_value_to_vec(out, val)?;
             }
-            val => serialize_value_to_vec(out, val)?,
         }
         num_field_values += 1;
     }

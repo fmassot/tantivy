@@ -153,6 +153,64 @@ impl ColumnCodecEstimator for LinearCodecEstimator {
             self.collect_before_line_estimation(value);
         }
     }
+
+    fn collect_slice(&mut self, values: &[u64]) {
+        if values.is_empty() {
+            return;
+        }
+        if self.line.is_none() && self.block.is_empty() && values.len() >= LINE_ESTIMATION_BLOCK_LEN
+        {
+            let line = Line::train(&VecColumn::from(
+                values[..LINE_ESTIMATION_BLOCK_LEN].to_vec(),
+            ));
+            let mut min_dev = self.min_deviation;
+            let mut max_dev = self.max_deviation;
+            let base_row = self.row_id;
+            for (offset, &val) in values.iter().enumerate() {
+                let interpolated = line.eval(base_row + offset as u32);
+                let deviation = val.wrapping_add(HALF_SPACE).wrapping_sub(interpolated);
+                min_dev = min_dev.min(deviation);
+                max_dev = max_dev.max(deviation);
+            }
+            self.min_deviation = min_dev;
+            self.max_deviation = max_dev;
+            if base_row == 0 {
+                self.first_val = values[0];
+            }
+            self.last_val = *values.last().unwrap();
+            self.row_id = base_row + values.len() as u32;
+            self.line = Some(line);
+            return;
+        }
+        for &val in values {
+            self.collect(val);
+        }
+    }
+
+    fn serialize_slice(
+        &self,
+        stats: &ColumnStats,
+        vals: &[u64],
+        wrt: &mut dyn io::Write,
+    ) -> io::Result<()> {
+        stats.serialize(wrt)?;
+        let line = self.line.unwrap();
+        let amplitude = self.max_deviation - self.min_deviation;
+        let num_bits = compute_num_bits(amplitude);
+        let linear_params = LinearParams {
+            line,
+            bit_unpacker: BitUnpacker::new(num_bits),
+        };
+        linear_params.serialize(wrt)?;
+        let mut bit_packer = BitPacker::new();
+        for (pos, &value) in vals.iter().enumerate() {
+            let calculated_value = line.eval(pos as u32);
+            let offset = value.wrapping_sub(calculated_value);
+            bit_packer.write(offset, num_bits, wrt)?;
+        }
+        bit_packer.close(wrt)?;
+        Ok(())
+    }
 }
 
 impl LinearCodecEstimator {

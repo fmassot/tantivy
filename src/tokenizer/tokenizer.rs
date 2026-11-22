@@ -84,7 +84,9 @@ impl TextAnalyzer {
     /// Allows hot indexing loops (`FastFieldsWriter`, `InvertedIndexPluginWriter`) to bypass
     /// `BoxTokenStream` allocation and `Token.text` string copying.
     pub(crate) fn raw_pass_through_limit(&self) -> Option<usize> {
-        let any = self.tokenizer.as_any();
+        // Dereference the `Box` so `as_any()` dispatches through the trait object vtable to the
+        // concrete inner tokenizer rather than `<Box<dyn BoxableTokenizer> as BoxableTokenizer>`.
+        let any = (*self.tokenizer).as_any();
         if any.is::<RawTokenizer>() {
             return Some(usize::MAX);
         }
@@ -150,6 +152,28 @@ mod tests {
 
     use super::*;
     use crate::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer};
+
+    #[test]
+    fn test_raw_pass_through_limit() {
+        let raw_only = TextAnalyzer::from(RawTokenizer::default());
+        assert_eq!(raw_only.raw_pass_through_limit(), Some(usize::MAX));
+
+        let raw_with_limit = TextAnalyzer::builder(RawTokenizer::default())
+            .filter(RemoveLongFilter::limit(256))
+            .build();
+        assert_eq!(raw_with_limit.raw_pass_through_limit(), Some(256));
+
+        let raw_lowercased = TextAnalyzer::builder(RawTokenizer::default())
+            .filter(LowerCaser)
+            .filter(RemoveLongFilter::limit(256))
+            .build();
+        assert_eq!(raw_lowercased.raw_pass_through_limit(), None);
+
+        let simple = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(40))
+            .build();
+        assert_eq!(simple.raw_pass_through_limit(), None);
+    }
 
     #[test]
     fn test_text_analyzer_builder() {
