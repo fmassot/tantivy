@@ -470,6 +470,39 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(true)
     }
 
+    /// Streams every term in the dictionary in lexicographical order, invoking `cb` for each term.
+    ///
+    /// Decodes each block directly from its local byte slice without ordinal bookkeeping or
+    /// per-term reader reloads.
+    pub fn stream_all_terms_cb(&self, mut cb: impl FnMut(&[u8])) -> io::Result<()> {
+        if self.num_terms == 0 {
+            return Ok(());
+        }
+        let mut delta_reader =
+            DeltaReader::<TSSTable::ValueReader>::new(self.sstable_slice.read_bytes()?);
+        let mut bytes = Vec::with_capacity(256);
+        while let Some(mut block) = delta_reader.next_block()? {
+            while !block.is_empty() {
+                let header = block[0];
+                block = &block[1..];
+                let (keep, add) = if header == 1u8 {
+                    let (c1, keep) = crate::vint::deserialize_read(block);
+                    block = &block[c1..];
+                    let (c2, add) = crate::vint::deserialize_read(block);
+                    block = &block[c2..];
+                    (keep as usize, add as usize)
+                } else {
+                    ((header & 0b1111) as usize, (header >> 4) as usize)
+                };
+                bytes.truncate(keep);
+                bytes.extend_from_slice(&block[..add]);
+                block = &block[add..];
+                cb(&bytes);
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the terms for a _sorted_ list of term ordinals.
     ///
     /// Returns true if and only if all terms have been found.
@@ -479,6 +512,75 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         mut cb: impl FnMut(&[u8]),
     ) -> io::Result<bool> {
         assert!(ords.is_sorted());
+        if ords.is_empty() {
+            return Ok(true);
+        }
+
+        // Dense sequential fast path: when the requested ordinals cover a large fraction of the
+        // dictionary (e.g. string cardinality over most docs), stream each block directly from its
+        // local byte slice without per-term DeltaReader reloads or binary-searching block bounds.
+        if self.num_terms > 0 && ords.len().saturating_mul(4) >= self.num_terms as usize {
+            if let Some(&last_ord) = ords.last() {
+                if last_ord >= self.num_terms {
+                    return Ok(false);
+                }
+            }
+            let is_all_terms = ords.len() as u64 == self.num_terms
+                && ords.first() == Some(&0)
+                && ords.last() == Some(&(self.num_terms - 1))
+                && ords.iter().enumerate().all(|(idx, &ord)| ord == idx as u64);
+            if is_all_terms {
+                let mut emitted: u64 = 0;
+                self.stream_all_terms_cb(|term| {
+                    cb(term);
+                    emitted += 1;
+                })?;
+                return Ok(emitted == self.num_terms);
+            }
+
+            let mut delta_reader =
+                DeltaReader::<TSSTable::ValueReader>::new(self.sstable_slice.read_bytes()?);
+            let mut bytes = Vec::with_capacity(256);
+            let mut current_ord: u64 = 0;
+            let mut ord_idx: usize = 0;
+            let mut next_target = ords[0];
+
+            while let Some(mut block) = delta_reader.next_block()? {
+                while !block.is_empty() {
+                    let header = block[0];
+                    block = &block[1..];
+                    let (keep, add) = if header == 1u8 {
+                        let (c1, keep) = crate::vint::deserialize_read(block);
+                        block = &block[c1..];
+                        let (c2, add) = crate::vint::deserialize_read(block);
+                        block = &block[c2..];
+                        (keep as usize, add as usize)
+                    } else {
+                        ((header & 0b1111) as usize, (header >> 4) as usize)
+                    };
+                    bytes.truncate(keep);
+                    bytes.extend_from_slice(&block[..add]);
+                    block = &block[add..];
+
+                    if current_ord == next_target {
+                        loop {
+                            cb(&bytes);
+                            ord_idx += 1;
+                            if ord_idx == ords.len() {
+                                return Ok(true);
+                            }
+                            next_target = ords[ord_idx];
+                            if next_target != current_ord {
+                                break;
+                            }
+                        }
+                    }
+                    current_ord += 1;
+                }
+            }
+            return Ok(ord_idx == ords.len());
+        }
+
         let mut ords = ords.iter().copied();
         let Some(mut ord) = ords.next() else {
             return Ok(true);

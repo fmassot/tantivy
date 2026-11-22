@@ -297,6 +297,19 @@ where TValueReader: value::ValueReader
         Ok(self.read_delta_key())
     }
 
+    /// Loads the next block into the decompression buffer and returns its raw delta-encoded
+    /// key bytes, or `Ok(None)` at EOF.
+    #[inline]
+    pub fn next_block(&mut self) -> io::Result<Option<&[u8]>> {
+        if !self.block_reader.read_block()? {
+            return Ok(None);
+        }
+        let consumed_len = self.value_reader.load(self.block_reader.buffer())?;
+        self.block_reader.advance(consumed_len);
+        self.idx = usize::MAX;
+        Ok(Some(self.block_reader.buffer()))
+    }
+
     #[inline(always)]
     pub fn common_prefix_len(&self) -> usize {
         self.common_prefix_len

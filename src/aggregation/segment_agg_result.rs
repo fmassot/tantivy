@@ -10,6 +10,36 @@ use super::intermediate_agg_result::IntermediateAggregationResults;
 use crate::aggregation::agg_data::AggregationsSegmentCtx;
 use crate::aggregation::BucketId;
 
+/// Returns `true` when `docs` is strictly increasing (no duplicate doc IDs), enabling
+/// single-call vectorized block loading in `collect_multiple`.
+#[inline]
+pub(crate) fn is_strictly_increasing(docs: &[crate::DocId]) -> bool {
+    docs.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+/// Default run-grouped fallback for `collect_multiple` when `docs` contains duplicate doc IDs
+/// (possible under a multivalued parent aggregation).
+#[inline]
+pub(crate) fn collect_multiple_fallback<C: SegmentAggregationCollector + ?Sized>(
+    collector: &mut C,
+    bucket_ids: &[BucketId],
+    docs: &[crate::DocId],
+    agg_data: &mut AggregationsSegmentCtx,
+) -> crate::Result<()> {
+    debug_assert_eq!(bucket_ids.len(), docs.len());
+    let mut start = 0;
+    while start < bucket_ids.len() {
+        let bucket_id = bucket_ids[start];
+        let mut end = start + 1;
+        while end < bucket_ids.len() && bucket_ids[end] == bucket_id {
+            end += 1;
+        }
+        collector.collect(bucket_id, &docs[start..end], agg_data)?;
+        start = end;
+    }
+    Ok(())
+}
+
 /// Monotonically increasing provider of BucketIds.
 #[derive(Debug, Clone, Default)]
 pub struct BucketIdProvider(u32);
@@ -169,6 +199,18 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
     ) -> crate::Result<()> {
         for collector in &mut self.aggs {
             collector.collect(parent_bucket_id, docs, agg_data)?;
+        }
+        Ok(())
+    }
+
+    fn collect_multiple(
+        &mut self,
+        bucket_ids: &[BucketId],
+        docs: &[crate::DocId],
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        for collector in &mut self.aggs {
+            collector.collect_multiple(bucket_ids, docs, agg_data)?;
         }
         Ok(())
     }

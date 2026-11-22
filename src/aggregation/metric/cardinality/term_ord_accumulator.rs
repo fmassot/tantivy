@@ -84,9 +84,8 @@ impl PagedBitset {
                 self.pages[page_idx].as_mut().unwrap()
             }
         };
-        if page.words[word_idx].insert_mut(bit_idx) {
-            self.count += 1;
-        }
+        let inserted = page.words[word_idx].insert_mut(bit_idx);
+        self.count += u64::from(inserted);
     }
 
     /// Number of set bits. O(1).
@@ -150,6 +149,17 @@ pub(crate) trait TermOrdAccumulator: Sized {
     fn maybe_compact(&mut self) {}
     fn len(&self) -> usize;
     fn iter_ords(&self) -> impl Iterator<Item = u64> + '_;
+    /// Returns `true` if `iter_ords()` yields strictly ascending ordinals.
+    fn is_iter_sorted(&self) -> bool;
+    /// Sets the corresponding bit in `union_words` for every ordinal `< limit_ord` in this
+    /// accumulator. Implementations backed by flat bitsets override this with word-level bitwise OR.
+    fn union_into_words(&self, union_words: &mut [u64], limit_ord: u64) {
+        for ord in self.iter_ords() {
+            if ord < limit_ord {
+                union_words[(ord >> 6) as usize] |= 1u64 << (ord & 63);
+            }
+        }
+    }
 }
 
 impl TermOrdAccumulator for BitSet {
@@ -181,6 +191,11 @@ impl TermOrdAccumulator for BitSet {
                 .map(move |bit| chunk_base + u64::from(bit))
         })
     }
+    #[inline]
+    fn is_iter_sorted(&self) -> bool {
+        true
+    }
+
     #[inline(never)] //< required to not have a perf regression
     fn extend_from_iter(&mut self, ords: impl IntoIterator<Item = u64>) {
         for ord in ords {
@@ -189,11 +204,74 @@ impl TermOrdAccumulator for BitSet {
     }
 }
 
+/// Upper bound (exclusive) for promoting `TermOrdSet` into a flat contiguous `Vec<u64>` bitset
+/// (524_288 bits = 64 KiB) instead of a two-level `PagedBitset`. Avoids pointer chasing through
+/// `Option<Box<PagedBitsetPage>>` for high-cardinality segments that still fit comfortably in L2.
+const FLAT_BITSET_MAX_TERM_ORD: u64 = 524_288;
+
+/// Contiguous flat bitset backed by `Vec<u64>` with branchless count maintenance.
+pub(crate) struct FlatBitset {
+    words: Vec<u64>,
+    count: u64,
+}
+
+impl FlatBitset {
+    fn with_max_term_ord(max_term_ord: u64) -> Self {
+        let num_words = (max_term_ord as usize >> 6) + 1;
+        Self {
+            words: vec![0u64; num_words],
+            count: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, term_ord: u64) {
+        let word_idx = (term_ord >> 6) as usize;
+        let bit_mask = 1u64 << (term_ord & 63);
+        let word = &mut self.words[word_idx];
+        let prev = *word;
+        let next = prev | bit_mask;
+        *word = next;
+        self.count += u64::from(next != prev);
+    }
+
+    #[inline]
+    fn len(&self) -> u64 {
+        self.count
+    }
+
+    fn iter_sorted(&self) -> impl Iterator<Item = u64> + '_ {
+        self.words.iter().enumerate().flat_map(|(word_idx, &word)| {
+            let base = (word_idx as u64) << 6;
+            FlatWordIter { word, base }
+        })
+    }
+}
+
+struct FlatWordIter {
+    word: u64,
+    base: u64,
+}
+
+impl Iterator for FlatWordIter {
+    type Item = u64;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<u64> {
+        if self.word == 0 {
+            return None;
+        }
+        let bit = self.word.trailing_zeros() as u64;
+        self.word &= self.word - 1;
+        Some(self.base + bit)
+    }
+}
+
 // TermOrdSet: adaptive sparse->dense accumulator.
 //
 // Starts as an HashSet (cheap when few ords are seen). When occupancy
 // crosses `len * PROMOTION_RATIO > max_term_ord_inclusive`, drains into
-// a `PagedBitset` and continues dense.
+// a `FlatBitset` (for <= 64 KiB) or `PagedBitset` and continues dense.
 pub(crate) struct TermOrdSet {
     inner: TermOrdSetInner,
     /// Largest term_ord that may be inserted. Used for both sizing the
@@ -203,6 +281,7 @@ pub(crate) struct TermOrdSet {
 
 enum TermOrdSetInner {
     Sparse(FxHashSet<u64>),
+    Flat(FlatBitset),
     Dense(PagedBitset),
 }
 
@@ -220,6 +299,7 @@ impl TermOrdAccumulator for TermOrdSet {
             TermOrdSetInner::Sparse(set) => {
                 set.insert(term_ord);
             }
+            TermOrdSetInner::Flat(bitset) => bitset.insert(term_ord),
             TermOrdSetInner::Dense(bitset) => bitset.insert(term_ord),
         }
     }
@@ -229,12 +309,25 @@ impl TermOrdAccumulator for TermOrdSet {
             TermOrdSetInner::Sparse(set) => {
                 set.extend(ords);
             }
+            TermOrdSetInner::Flat(bitset) => {
+                for ord in ords {
+                    bitset.insert(ord);
+                }
+            }
             TermOrdSetInner::Dense(bitset) => {
                 for ord in ords {
                     bitset.insert(ord);
                 }
             }
         }
+    }
+
+    #[inline]
+    fn is_iter_sorted(&self) -> bool {
+        matches!(
+            self.inner,
+            TermOrdSetInner::Flat(_) | TermOrdSetInner::Dense(_)
+        )
     }
 
     fn maybe_compact(&mut self) {
@@ -244,17 +337,27 @@ impl TermOrdAccumulator for TermOrdSet {
         if set.len() as u64 * PROMOTION_RATIO <= self.max_term_ord_inclusive {
             return;
         }
-        let mut bitset = PagedBitset::with_max_term_ord(self.max_term_ord_inclusive + 1);
+        let max_with_missing = self.max_term_ord_inclusive + 1;
         let set = std::mem::take(set);
-        for ord in set {
-            bitset.insert(ord);
+        if max_with_missing < FLAT_BITSET_MAX_TERM_ORD {
+            let mut bitset = FlatBitset::with_max_term_ord(max_with_missing);
+            for ord in set {
+                bitset.insert(ord);
+            }
+            self.inner = TermOrdSetInner::Flat(bitset);
+        } else {
+            let mut bitset = PagedBitset::with_max_term_ord(max_with_missing);
+            for ord in set {
+                bitset.insert(ord);
+            }
+            self.inner = TermOrdSetInner::Dense(bitset);
         }
-        self.inner = TermOrdSetInner::Dense(bitset);
     }
 
     fn len(&self) -> usize {
         match &self.inner {
             TermOrdSetInner::Sparse(set) => set.len(),
+            TermOrdSetInner::Flat(bitset) => bitset.len() as usize,
             TermOrdSetInner::Dense(bitset) => bitset.len() as usize,
         }
     }
@@ -262,7 +365,43 @@ impl TermOrdAccumulator for TermOrdSet {
     fn iter_ords(&self) -> impl Iterator<Item = u64> + '_ {
         match &self.inner {
             TermOrdSetInner::Sparse(set) => itertools::Either::Left(set.iter().copied()),
-            TermOrdSetInner::Dense(bitset) => itertools::Either::Right(bitset.iter_sorted()),
+            TermOrdSetInner::Flat(bitset) => {
+                itertools::Either::Right(itertools::Either::Left(bitset.iter_sorted()))
+            }
+            TermOrdSetInner::Dense(bitset) => {
+                itertools::Either::Right(itertools::Either::Right(bitset.iter_sorted()))
+            }
+        }
+    }
+
+    fn union_into_words(&self, union_words: &mut [u64], limit_ord: u64) {
+        match &self.inner {
+            TermOrdSetInner::Sparse(set) => {
+                for &ord in set {
+                    if ord < limit_ord {
+                        union_words[(ord >> 6) as usize] |= 1u64 << (ord & 63);
+                    }
+                }
+            }
+            TermOrdSetInner::Flat(bitset) => {
+                let num_words = bitset.words.len().min(union_words.len());
+                for word_idx in 0..num_words {
+                    union_words[word_idx] |= bitset.words[word_idx];
+                }
+                // Mask off any bits at or above `limit_ord` (e.g. the missing sentinel).
+                let rem_bits = (limit_ord & 63) as u32;
+                let last_word_idx = (limit_ord >> 6) as usize;
+                if rem_bits != 0 && last_word_idx < union_words.len() {
+                    union_words[last_word_idx] &= (1u64 << rem_bits) - 1;
+                }
+            }
+            TermOrdSetInner::Dense(bitset) => {
+                for ord in bitset.iter_sorted() {
+                    if ord < limit_ord {
+                        union_words[(ord >> 6) as usize] |= 1u64 << (ord & 63);
+                    }
+                }
+            }
         }
     }
 }
@@ -271,7 +410,22 @@ impl TermOrdAccumulator for TermOrdSet {
 mod tests {
     use common::BitSet;
 
-    use super::{PagedBitset, TermOrdAccumulator, TermOrdSet, PROMOTION_RATIO};
+    use super::{FlatBitset, PagedBitset, TermOrdAccumulator, TermOrdSet, PROMOTION_RATIO};
+
+    /// Unit-test `FlatBitset`: cross-word inserts, idempotent duplicates, and sorted iteration.
+    #[test]
+    fn flat_bitset_basic() {
+        let ords = [0u64, 1, 63, 64, 127, 128, 1024, 65_535, 100_000];
+        let max_ord = *ords.iter().max().unwrap();
+        let mut bitset = FlatBitset::with_max_term_ord(max_ord);
+        for &ord in &ords {
+            bitset.insert(ord);
+            bitset.insert(ord);
+        }
+        assert_eq!(bitset.len(), ords.len() as u64);
+        let collected: Vec<u64> = bitset.iter_sorted().collect();
+        assert_eq!(collected, ords);
+    }
 
     /// Unit-test the PagedBitset itself: cross-page inserts produce sorted
     /// iteration, len() matches the inserted set, and duplicates are
