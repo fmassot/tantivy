@@ -160,8 +160,7 @@ impl<ColumnRef: Borrow<Column<u64>> + std::fmt::Debug> ValueSource for (ColumnRe
             docids.clear();
             row_ids.clear();
             column.row_ids_for_docs(docs, docids, row_ids);
-            values.resize(row_ids.len(), 0u64);
-            column.values.get_vals(row_ids, values);
+            load_full_column_values(row_ids, &*column.values, values);
         }
         cardinality
     }

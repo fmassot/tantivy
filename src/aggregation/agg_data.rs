@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use columnar::{Column, ColumnType, StrColumn};
 use common::BitSet;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use tantivy_fst::Regex;
 
@@ -168,8 +168,41 @@ pub(crate) fn get_view_tree(nodes: &[AggNode]) -> Vec<AggTreeViewNode> {
 /// charge that child itself.
 pub(crate) fn build_segment_agg_collectors(
     ctx: &mut AggregationsSegmentCtx,
-    nodes: Vec<AggNode>,
+    mut nodes: Vec<AggNode>,
 ) -> crate::Result<Box<dyn SegmentAggregationCollector>> {
+    // Share identical physical `Column<u64>` instances across sibling metric collectors reading
+    // the same field and group them back-to-back, so `ColumnBlockAccessor`'s shared-docs cache
+    // decodes each physical column at most once per batch (e.g. sum + avg + max + stats on the
+    // same field).
+    if nodes.len() >= 2 {
+        let mut shared_metric_cols: FxHashMap<(String, ColumnType), Column<u64>> =
+            FxHashMap::default();
+        for node in &mut nodes {
+            if let AggNodeData::Metric(req_data) = &mut node.data {
+                let col_type = req_data.accessor.column_type();
+                if col_type != ColumnType::Str {
+                    if let Some(col) = req_data.accessor.as_physical_column() {
+                        let key = (req_data.field_name.clone(), col_type);
+                        if let Some(existing) = shared_metric_cols.get(&key) {
+                            req_data.accessor = Box::new((existing.clone(), col_type));
+                        } else {
+                            shared_metric_cols.insert(key, col.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if nodes.len() > 2 {
+        nodes.sort_by_key(|node| match &node.data {
+            AggNodeData::Metric(req_data) => req_data
+                .accessor
+                .as_physical_column()
+                .map(|col| (0u8, Arc::as_ptr(&col.values) as *const () as usize))
+                .unwrap_or((1u8, 0)),
+            _ => (2u8, 0),
+        });
+    }
     // The request data is moved into the collectors, so we need to measure it beforehand.
     let memory_consumption: usize = nodes.iter().map(AggNode::get_memory_consumption).sum();
     let mut collectors = Vec::with_capacity(nodes.len());
@@ -460,6 +493,7 @@ fn build_nodes(
             let node_data = AggNodeData::Metric(MetricAggReqData {
                 accessor,
                 name: agg_name.to_string(),
+                field_name: field.clone(),
                 collecting_for,
                 missing: *missing,
                 missing_u64: (*missing).and_then(|m| f64_to_fastfield_u64(m, &field_type)),
@@ -488,6 +522,7 @@ fn build_nodes(
             let node_data = AggNodeData::Metric(MetricAggReqData {
                 accessor,
                 name: agg_name.to_string(),
+                field_name: percentiles_req.field_name().to_string(),
                 collecting_for: StatsType::Percentiles,
                 missing: percentiles_req.missing,
                 missing_u64: percentiles_req

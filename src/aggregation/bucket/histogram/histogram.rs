@@ -392,6 +392,13 @@ pub(crate) struct DenseRange {
 #[derive(Clone, Debug)]
 enum HistogramBuckets<B> {
     Sparse(FxHashMap<i64, SegmentHistogramBucketEntry<B>>),
+    /// Compact dense counts used when there are no sub-aggregations (`!B::ASSIGNS_ID`),
+    /// halving memory usage vs `Dense` (8 bytes/bucket vs 16) and triggering densification 2x
+    /// earlier.
+    DenseCounts {
+        base_pos: i64,
+        counts: Vec<u64>,
+    },
     Dense {
         base_pos: i64,
         /// One slot per bucket position; a slot with `doc_count == 0` has not been hit yet.
@@ -405,17 +412,24 @@ impl<B> Default for HistogramBuckets<B> {
 }
 impl<B: BucketIdSlot> HistogramBuckets<B> {
     fn memory_consumption(&self) -> u64 {
-        let num_slots = match self {
-            HistogramBuckets::Sparse(map) => map.capacity(),
-            HistogramBuckets::Dense { buckets, .. } => buckets.capacity(),
-        };
-        num_slots as u64 * std::mem::size_of::<SegmentHistogramBucketEntry<B>>() as u64
+        match self {
+            HistogramBuckets::Sparse(map) => {
+                map.capacity() as u64 * std::mem::size_of::<SegmentHistogramBucketEntry<B>>() as u64
+            }
+            HistogramBuckets::DenseCounts { counts, .. } => {
+                counts.capacity() as u64 * std::mem::size_of::<u64>() as u64
+            }
+            HistogramBuckets::Dense { buckets, .. } => {
+                buckets.capacity() as u64
+                    * std::mem::size_of::<SegmentHistogramBucketEntry<B>>() as u64
+            }
+        }
     }
 
     /// Switches from sparse to dense storage once the dense `Vec` would use no more memory than the
     /// hash map does now, so the switch never increases memory. Called at block boundaries.
     ///
-    /// The `Vec` holds one `Entry` per bucket position in the range. The map additionally stores
+    /// The `Vec` holds one slot per bucket position in the range. The map additionally stores
     /// the key and a control byte per slot, at a load factor of 7/16..7/8, so for a dense histogram
     /// its footprint grows past the `Vec` well before full coverage. And since the `Vec` never
     /// grows afterwards while the map would keep growing, dense only gets relatively cheaper — so
@@ -426,9 +440,12 @@ impl<B: BucketIdSlot> HistogramBuckets<B> {
         let HistogramBuckets::Sparse(map) = self else {
             return;
         };
-        let dense_bytes = range
-            .len
-            .saturating_mul(std::mem::size_of::<SegmentHistogramBucketEntry<B>>());
+        let slot_size = if !B::ASSIGNS_ID {
+            std::mem::size_of::<u64>()
+        } else {
+            std::mem::size_of::<SegmentHistogramBucketEntry<B>>()
+        };
+        let dense_bytes = range.len.saturating_mul(slot_size);
         let sparse_bytes = map
             .capacity()
             .saturating_mul(std::mem::size_of::<(i64, SegmentHistogramBucketEntry<B>)>() + 1);
@@ -436,14 +453,25 @@ impl<B: BucketIdSlot> HistogramBuckets<B> {
             return;
         }
         let map = std::mem::take(map);
-        let mut buckets = vec![SegmentHistogramBucketEntry::<B>::default(); range.len];
-        for (bucket_pos, entry) in map {
-            buckets[(bucket_pos - range.base_pos) as usize] = entry;
+        if !B::ASSIGNS_ID {
+            let mut counts = vec![0u64; range.len];
+            for (bucket_pos, entry) in map {
+                counts[(bucket_pos - range.base_pos) as usize] = entry.doc_count;
+            }
+            *self = HistogramBuckets::DenseCounts {
+                base_pos: range.base_pos,
+                counts,
+            };
+        } else {
+            let mut buckets = vec![SegmentHistogramBucketEntry::<B>::default(); range.len];
+            for (bucket_pos, entry) in map {
+                buckets[(bucket_pos - range.base_pos) as usize] = entry;
+            }
+            *self = HistogramBuckets::Dense {
+                base_pos: range.base_pos,
+                buckets,
+            };
         }
-        *self = HistogramBuckets::Dense {
-            base_pos: range.base_pos,
-            buckets,
-        };
     }
 
     /// Returns the bucket entry for `bucket_pos`, setting its key (and `bucket_id`, when `B` is
@@ -467,6 +495,9 @@ impl<B: BucketIdSlot> HistogramBuckets<B> {
                         bucket_id: B::assign(bucket_id_provider),
                     })
             }
+            HistogramBuckets::DenseCounts { .. } => {
+                unreachable!("DenseCounts is only used when !B::ASSIGNS_ID and no sub-aggs exist")
+            }
             HistogramBuckets::Dense { base_pos, buckets } => {
                 let idx = (bucket_pos - *base_pos) as usize;
                 debug_assert!(idx < buckets.len(), "bucket_pos outside the dense range");
@@ -480,15 +511,73 @@ impl<B: BucketIdSlot> HistogramBuckets<B> {
         }
     }
 
-    /// Consumes the storage, yielding all non-empty bucket entries.
-    fn into_filled_entries(self) -> Vec<SegmentHistogramBucketEntry<B>> {
+    /// Increments the document count for `bucket_pos` without requiring a `BucketId` (used when
+    /// there are no sub-aggregations, including multivalued batches on `DenseCounts`).
+    #[inline]
+    fn increment_count(
+        &mut self,
+        bucket_pos: i64,
+        bucket_id_provider: &mut BucketIdProvider,
+        key_from_pos: impl FnOnce(i64) -> f64,
+    ) {
         match self {
-            HistogramBuckets::Sparse(map) => map.into_values().collect(),
-            HistogramBuckets::Dense { buckets, .. } => {
-                buckets.into_iter().filter(|b| b.doc_count > 0).collect()
+            HistogramBuckets::DenseCounts { base_pos, counts } => {
+                let idx = (bucket_pos - *base_pos) as usize;
+                debug_assert!(idx < counts.len(), "bucket_pos outside the dense range");
+                counts[idx] += 1;
+            }
+            _ => {
+                self.get_or_create(bucket_pos, bucket_id_provider, key_from_pos)
+                    .doc_count += 1;
             }
         }
     }
+
+    /// Consumes the storage, yielding all non-empty bucket entries.
+    fn into_filled_entries(
+        self,
+        interval: f64,
+        offset: f64,
+    ) -> Vec<SegmentHistogramBucketEntry<B>> {
+        match self {
+            HistogramBuckets::Sparse(map) => map.into_values().collect(),
+            HistogramBuckets::DenseCounts { base_pos, counts } => counts
+                .into_iter()
+                .enumerate()
+                .filter(|(_, doc_count)| *doc_count > 0)
+                .map(|(idx, doc_count)| SegmentHistogramBucketEntry {
+                    key: get_bucket_key_from_pos((base_pos + idx as i64) as f64, interval, offset),
+                    doc_count,
+                    bucket_id: B::default(),
+                })
+                .collect(),
+            HistogramBuckets::Dense { base_pos, buckets } => buckets
+                .into_iter()
+                .enumerate()
+                .filter(|(_, bucket)| bucket.doc_count > 0)
+                .map(|(idx, mut bucket)| {
+                    bucket.key =
+                        get_bucket_key_from_pos((base_pos + idx as i64) as f64, interval, offset);
+                    bucket
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Exactness proof level for integer floor-division fast paths against IEEE-754 `f64` division.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastIntExactness {
+    /// Column bounds and interval satisfy `|val| < 2^52` and `interval < 2^52`, so integer floor
+    /// division matches `((val as f64) / (interval as f64)).floor()` identically for every value.
+    AlwaysExact,
+    /// Column bounds satisfy `|val| < 2^61` and `interval % 512 == 0`, so any block where every
+    /// `val` is a multiple of 512 (e.g. all second-precision timestamps from 1897..2043) matches
+    /// IEEE-754 `f64` floor division identically without per-value remainder checks.
+    ExactWhen512Aligned,
+    /// General case: verify a `SAFE_MARGIN` around bucket boundaries and fall back to `f64` near
+    /// boundaries.
+    SafeMarginOnly,
 }
 
 /// The collector puts values from the fast field into the correct buckets and does a conversion to
@@ -505,6 +594,9 @@ pub struct SegmentHistogramCollector<B, const SOURCE_CONTAINS_MULTIVALUES: bool>
     /// Theoretical bucket range derived from the column min/max, if dense `Vec` storage is
     /// viable. `None` keeps every parent bucket in the sparse hash map.
     dense_range: Option<DenseRange>,
+    /// Precomputed integer divider for the unbounded zero-offset fast path, avoiding
+    /// recomputing `DividerU64::divide_by` on every 64-doc block.
+    fast_int_divider: Option<(u64, fastdivide::DividerU64, FastIntExactness)>,
 }
 
 impl<B: BucketIdSlot, const SOURCE_CONTAINS_MULTIVALUES: bool> SegmentAggregationCollector
@@ -567,15 +659,259 @@ impl<B: BucketIdSlot, const SOURCE_CONTAINS_MULTIVALUES: bool> SegmentAggregatio
                         }
                         previous = Some((doc, bucket_pos));
                     }
-                    let bucket =
-                        store.get_or_create(bucket_pos, &mut self.bucket_id_provider, |pos| {
+                    if let Some(sub_agg) = &mut self.sub_agg {
+                        let bucket =
+                            store.get_or_create(bucket_pos, &mut self.bucket_id_provider, |pos| {
+                                get_bucket_key_from_pos(pos as f64, interval, offset)
+                            });
+                        bucket.doc_count += 1;
+                        sub_agg.push(bucket.bucket_id.to_bucket_id(), doc);
+                    } else {
+                        store.increment_count(bucket_pos, &mut self.bucket_id_provider, |pos| {
                             get_bucket_key_from_pos(pos as f64, interval, offset)
                         });
-                    bucket.doc_count += 1;
-                    if let Some(sub_agg) = &mut self.sub_agg {
-                        sub_agg.push(bucket.bucket_id.to_bucket_id(), doc);
                     }
                 }
+            }
+        } else if let HistogramBuckets::DenseCounts { base_pos, counts } = store {
+            let is_unbounded = bounds == HistogramBounds::UNBOUNDED;
+            let vals = accessor.values();
+            if let Some((interval_u64, divider, exactness)) = self.fast_int_divider {
+                let num_buckets = counts.len();
+                match self.column_type {
+                    ColumnType::DateTime | ColumnType::I64 => {
+                        let base_origin_opt = base_pos.checked_mul(interval_u64 as i64);
+                        if let Some(base_origin) = base_origin_opt {
+                            let all_exact = match exactness {
+                                FastIntExactness::AlwaysExact => {
+                                    vals.iter().all(|&val| i64::from_u64(val) >= base_origin)
+                                }
+                                FastIntExactness::ExactWhen512Aligned => {
+                                    let mut low_bits_or = 0u64;
+                                    let mut all_ge_origin = true;
+                                    for &val in vals {
+                                        let val_i64 = i64::from_u64(val);
+                                        low_bits_or |= val_i64 as u64;
+                                        all_ge_origin &= val_i64 >= base_origin;
+                                    }
+                                    all_ge_origin && (low_bits_or & 511) == 0
+                                }
+                                FastIntExactness::SafeMarginOnly => false,
+                            };
+                            if all_exact {
+                                for &val in vals {
+                                    let delta = i64::from_u64(val).wrapping_sub(base_origin) as u64;
+                                    let idx = divider.divide(delta) as usize;
+                                    debug_assert!(idx < num_buckets);
+                                    counts[idx] += 1;
+                                }
+                            } else {
+                                const SAFE_MARGIN: u64 = 2048;
+                                let use_margin = interval_u64 > SAFE_MARGIN * 2;
+                                for &val in vals {
+                                    let val_i64 = i64::from_u64(val);
+                                    let idx = if use_margin && val_i64 >= base_origin {
+                                        let delta = val_i64.wrapping_sub(base_origin) as u64;
+                                        let quotient = divider.divide(delta);
+                                        let rem = delta - quotient.wrapping_mul(interval_u64);
+                                        if rem >= SAFE_MARGIN && rem < interval_u64 - SAFE_MARGIN {
+                                            quotient as usize
+                                        } else {
+                                            (get_bucket_pos(val_i64 as f64) - *base_pos) as usize
+                                        }
+                                    } else {
+                                        (get_bucket_pos(val_i64 as f64) - *base_pos) as usize
+                                    };
+                                    debug_assert!(idx < num_buckets);
+                                    counts[idx] += 1;
+                                }
+                            }
+                        } else {
+                            for &val in vals {
+                                let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                                let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                                debug_assert!(idx < num_buckets);
+                                counts[idx] += 1;
+                            }
+                        }
+                    }
+                    ColumnType::U64 => {
+                        let base_origin_opt = u64::try_from(*base_pos)
+                            .ok()
+                            .and_then(|bp| bp.checked_mul(interval_u64));
+                        if let Some(base_origin) = base_origin_opt {
+                            if exactness == FastIntExactness::AlwaysExact
+                                && vals.iter().all(|&val| val >= base_origin)
+                            {
+                                for &val in vals {
+                                    let idx = divider.divide(val - base_origin) as usize;
+                                    debug_assert!(idx < num_buckets);
+                                    counts[idx] += 1;
+                                }
+                            } else {
+                                const SAFE_MARGIN: u64 = 4096;
+                                let use_margin = interval_u64 > SAFE_MARGIN * 2;
+                                for &val in vals {
+                                    let idx = if use_margin && val >= base_origin {
+                                        let delta = val - base_origin;
+                                        let quotient = divider.divide(delta);
+                                        let rem = delta - quotient.wrapping_mul(interval_u64);
+                                        if rem >= SAFE_MARGIN && rem < interval_u64 - SAFE_MARGIN {
+                                            quotient as usize
+                                        } else {
+                                            (get_bucket_pos(val as f64) - *base_pos) as usize
+                                        }
+                                    } else {
+                                        (get_bucket_pos(val as f64) - *base_pos) as usize
+                                    };
+                                    debug_assert!(idx < num_buckets);
+                                    counts[idx] += 1;
+                                }
+                            }
+                        } else {
+                            for &val in vals {
+                                let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                                let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                                debug_assert!(idx < num_buckets);
+                                counts[idx] += 1;
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            } else if is_unbounded {
+                for &val in vals {
+                    let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                    let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                    debug_assert!(idx < counts.len());
+                    counts[idx] += 1;
+                }
+            } else {
+                for &val in vals {
+                    let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                    if bounds.contains(val_f64) {
+                        let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                        debug_assert!(idx < counts.len());
+                        counts[idx] += 1;
+                    }
+                }
+            }
+        } else if let HistogramBuckets::Dense { base_pos, buckets } = store {
+            let is_unbounded = bounds == HistogramBounds::UNBOUNDED;
+            if is_unbounded {
+                for val in accessor.iter_vals() {
+                    let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                    let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                    debug_assert!(idx < buckets.len());
+                    buckets[idx].doc_count += 1;
+                }
+            } else {
+                for val in accessor.iter_vals() {
+                    let val_f64 = f64_from_fastfield_u64(val, self.column_type);
+                    if bounds.contains(val_f64) {
+                        let idx = (get_bucket_pos(val_f64) - *base_pos) as usize;
+                        debug_assert!(idx < buckets.len());
+                        buckets[idx].doc_count += 1;
+                    }
+                }
+            }
+        } else if let Some((interval_u64, divider, exactness)) = self.fast_int_divider {
+            let vals = accessor.values();
+            let HistogramBuckets::Sparse(map) = store else {
+                unreachable!()
+            };
+            let interval_i64 = interval_u64 as i64;
+            match self.column_type {
+                ColumnType::DateTime | ColumnType::I64 => {
+                    let all_nonneg_exact = match exactness {
+                        FastIntExactness::AlwaysExact => {
+                            vals.iter().all(|&val| i64::from_u64(val) >= 0)
+                        }
+                        FastIntExactness::ExactWhen512Aligned => {
+                            let mut low_bits_or = 0u64;
+                            let mut all_nonneg = true;
+                            for &val in vals {
+                                let val_i64 = i64::from_u64(val);
+                                low_bits_or |= val_i64 as u64;
+                                all_nonneg &= val_i64 >= 0;
+                            }
+                            all_nonneg && (low_bits_or & 511) == 0
+                        }
+                        FastIntExactness::SafeMarginOnly => false,
+                    };
+                    if all_nonneg_exact {
+                        for &val in vals {
+                            let bucket_pos = divider.divide(i64::from_u64(val) as u64) as i64;
+                            let entry = map.entry(bucket_pos).or_insert_with(|| {
+                                SegmentHistogramBucketEntry {
+                                    key: get_bucket_key_from_pos(
+                                        bucket_pos as f64,
+                                        interval,
+                                        offset,
+                                    ),
+                                    doc_count: 0,
+                                    bucket_id: B::assign(&mut self.bucket_id_provider),
+                                }
+                            });
+                            entry.doc_count += 1;
+                        }
+                    } else {
+                        for &val in vals {
+                            let val_i64 = i64::from_u64(val);
+                            let bucket_pos = if val_i64 >= 0 && interval_i64 > 0 {
+                                const SAFE_MARGIN: u64 = 2048;
+                                if interval_u64 > SAFE_MARGIN * 2 {
+                                    let val_u64 = val_i64 as u64;
+                                    let quotient = divider.divide(val_u64);
+                                    let rem = val_u64 - quotient.wrapping_mul(interval_u64);
+                                    if rem >= SAFE_MARGIN && rem < interval_u64 - SAFE_MARGIN {
+                                        quotient as i64
+                                    } else {
+                                        get_bucket_pos(val_i64 as f64)
+                                    }
+                                } else {
+                                    get_bucket_pos(val_i64 as f64)
+                                }
+                            } else {
+                                get_bucket_pos(val_i64 as f64)
+                            };
+                            let entry = map.entry(bucket_pos).or_insert_with(|| {
+                                SegmentHistogramBucketEntry {
+                                    key: get_bucket_key_from_pos(
+                                        bucket_pos as f64,
+                                        interval,
+                                        offset,
+                                    ),
+                                    doc_count: 0,
+                                    bucket_id: B::assign(&mut self.bucket_id_provider),
+                                }
+                            });
+                            entry.doc_count += 1;
+                        }
+                    }
+                }
+                ColumnType::U64 => {
+                    for &val in vals {
+                        let bucket_pos = if exactness == FastIntExactness::AlwaysExact {
+                            divider.divide(val) as i64
+                        } else {
+                            get_bucket_pos(val as f64)
+                        };
+                        let entry =
+                            map.entry(bucket_pos)
+                                .or_insert_with(|| SegmentHistogramBucketEntry {
+                                    key: get_bucket_key_from_pos(
+                                        bucket_pos as f64,
+                                        interval,
+                                        offset,
+                                    ),
+                                    doc_count: 0,
+                                    bucket_id: B::assign(&mut self.bucket_id_provider),
+                                });
+                        entry.doc_count += 1;
+                    }
+                }
+                _ => unreachable!(),
             }
         } else {
             for val in accessor.iter_vals() {
@@ -649,7 +985,8 @@ impl<B: BucketIdSlot, const SOURCE_CONTAINS_MULTIVALUES: bool>
         agg_data: &AggregationsSegmentCtx,
         histogram: HistogramBuckets<B>,
     ) -> crate::Result<IntermediateBucketResult> {
-        let filled = histogram.into_filled_entries();
+        let filled =
+            histogram.into_filled_entries(self.req_data.req.interval, self.req_data.offset);
         let mut buckets = Vec::with_capacity(filled.len());
 
         for bucket in filled {
@@ -678,6 +1015,52 @@ impl<B: BucketIdSlot, const SOURCE_CONTAINS_MULTIVALUES: bool>
         );
         let sub_agg = sub_agg.map(BufferedSubAggs::new);
         let column_type = req_data.accessor.column_type();
+        let fast_int_divider = if req_data.bounds == HistogramBounds::UNBOUNDED
+            && req_data.offset == 0.0
+            && req_data.req.interval >= 1.0
+            && req_data.req.interval.fract() == 0.0
+            && req_data.req.interval <= (1u64 << 53) as f64
+            && matches!(
+                column_type,
+                ColumnType::DateTime | ColumnType::I64 | ColumnType::U64
+            ) {
+            let interval_u64 = req_data.req.interval as u64;
+            let exactness = match (column_type, req_data.accessor.bounds()) {
+                (ColumnType::DateTime | ColumnType::I64, Some((min_u64, max_u64))) => {
+                    let min_i64 = i64::from_u64(min_u64);
+                    let max_i64 = i64::from_u64(max_u64);
+                    if min_i64 > -(1i64 << 52)
+                        && max_i64 < (1i64 << 52)
+                        && interval_u64 < (1u64 << 52)
+                    {
+                        FastIntExactness::AlwaysExact
+                    } else if min_i64 > -(1i64 << 61)
+                        && max_i64 < (1i64 << 61)
+                        && (interval_u64 & 511) == 0
+                        && (interval_u64 >> 9) < (1u64 << 52)
+                    {
+                        FastIntExactness::ExactWhen512Aligned
+                    } else {
+                        FastIntExactness::SafeMarginOnly
+                    }
+                }
+                (ColumnType::U64, Some((_min_u64, max_u64))) => {
+                    if max_u64 < (1u64 << 52) && interval_u64 < (1u64 << 52) {
+                        FastIntExactness::AlwaysExact
+                    } else {
+                        FastIntExactness::SafeMarginOnly
+                    }
+                }
+                _ => FastIntExactness::SafeMarginOnly,
+            };
+            Some((
+                interval_u64,
+                fastdivide::DividerU64::divide_by(interval_u64),
+                exactness,
+            ))
+        } else {
+            None
+        };
         Self {
             parent_buckets: Default::default(),
             sub_agg,
@@ -685,6 +1068,7 @@ impl<B: BucketIdSlot, const SOURCE_CONTAINS_MULTIVALUES: bool>
             column_type,
             bucket_id_provider: BucketIdProvider::default(),
             dense_range,
+            fast_int_divider,
         }
     }
 }
@@ -703,6 +1087,7 @@ impl SegmentHistogramCollector<(), false> {
             column_type,
             bucket_id_provider: BucketIdProvider::default(),
             dense_range: None,
+            fast_int_divider: None,
         }
     }
 

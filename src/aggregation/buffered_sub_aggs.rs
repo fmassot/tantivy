@@ -34,6 +34,7 @@ pub(crate) struct BufferedSubAggs<B: SubAggBuffer> {
     buffer: B,
     sub_agg_collector: Box<dyn SegmentAggregationCollector>,
     num_docs: usize,
+    flush_threshold: usize,
 }
 
 pub type LowCardBufferedSubAggs = BufferedSubAggs<LowCardSubAggBuffer>;
@@ -47,6 +48,16 @@ const FLUSH_THRESHOLD: usize = 2048;
 pub trait SubAggBuffer: Debug {
     fn new() -> Self;
     fn push(&mut self, bucket_id: BucketId, doc_id: DocId);
+    /// Ensures internal storage can accept bucket IDs up to `max_bucket_id` without resizing on
+    /// every push.
+    #[inline]
+    fn ensure_buckets(&mut self, _max_bucket_id: BucketId) {}
+    /// Pushes `(bucket_id, doc_id)` assuming `ensure_buckets` has already been called for at least
+    /// `bucket_id`.
+    #[inline]
+    fn push_preallocated(&mut self, bucket_id: BucketId, doc_id: DocId) {
+        self.push(bucket_id, doc_id);
+    }
     fn flush_local(
         &mut self,
         sub_agg: &mut Box<dyn SegmentAggregationCollector>,
@@ -56,10 +67,18 @@ pub trait SubAggBuffer: Debug {
 
 impl<Backend: SubAggBuffer + Debug> BufferedSubAggs<Backend> {
     pub fn new(sub_agg: Box<dyn SegmentAggregationCollector>) -> Self {
+        Self::with_flush_threshold(sub_agg, FLUSH_THRESHOLD)
+    }
+
+    pub fn with_flush_threshold(
+        sub_agg: Box<dyn SegmentAggregationCollector>,
+        flush_threshold: usize,
+    ) -> Self {
         Self {
             buffer: Backend::new(),
             sub_agg_collector: sub_agg,
             num_docs: 0,
+            flush_threshold,
         }
     }
 
@@ -73,13 +92,34 @@ impl<Backend: SubAggBuffer + Debug> BufferedSubAggs<Backend> {
         self.num_docs += 1;
     }
 
+    /// Ensures internal storage can accept bucket IDs up to `max_bucket_id` without resizing on
+    /// every push.
+    #[inline]
+    pub fn ensure_buckets(&mut self, max_bucket_id: BucketId) {
+        self.buffer.ensure_buckets(max_bucket_id);
+    }
+
+    /// Pushes `(bucket_id, doc_id)` without incrementing `num_docs` or checking bucket table
+    /// bounds. Callers must call [`Self::ensure_buckets`] beforehand and
+    /// [`Self::add_buffered_docs`] afterwards.
+    #[inline]
+    pub fn push_preallocated(&mut self, bucket_id: BucketId, doc_id: DocId) {
+        self.buffer.push_preallocated(bucket_id, doc_id);
+    }
+
+    /// Accounts for `count` documents pushed via [`Self::push_preallocated`].
+    #[inline]
+    pub fn add_buffered_docs(&mut self, count: usize) {
+        self.num_docs += count;
+    }
+
     /// Check if we need to flush based on the number of documents cached.
     /// If so, flushes the cache to the provided aggregation collector.
     pub fn check_flush_local(
         &mut self,
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        if self.num_docs >= FLUSH_THRESHOLD {
+        if self.num_docs >= self.flush_threshold {
             self.buffer
                 .flush_local(&mut self.sub_agg_collector, agg_data)?;
             self.num_docs = 0;
@@ -208,6 +248,19 @@ impl SubAggBuffer for LowCardSubAggBuffer {
             self.per_bucket_docs.resize_with(idx + 1, Vec::new);
         }
         self.per_bucket_docs[idx].push(doc_id);
+    }
+
+    #[inline]
+    fn ensure_buckets(&mut self, max_bucket_id: BucketId) {
+        let required_len = max_bucket_id as usize + 1;
+        if self.per_bucket_docs.len() < required_len {
+            self.per_bucket_docs.resize_with(required_len, Vec::new);
+        }
+    }
+
+    #[inline]
+    fn push_preallocated(&mut self, bucket_id: BucketId, doc_id: DocId) {
+        self.per_bucket_docs[bucket_id as usize].push(doc_id);
     }
 
     fn flush_local(

@@ -1,9 +1,25 @@
 use std::cmp::Ordering;
+use std::sync::Arc;
 
-use columnar::{Cardinality, ColumnValues, RowId};
+use columnar::{Cardinality, ColumnType, ColumnValues, RowId};
 
 use crate::aggregation::value_source::ValueSource;
 use crate::DocId;
+
+/// Cache key identifying a decoded physical-column block held inside [`ColumnBlockAccessor`]
+/// during a shared-docs sibling collector pass (see
+/// [`ColumnBlockAccessor::enter_shared_docs_scope`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedBlockCacheKey {
+    epoch: u64,
+    docs_ptr: usize,
+    docs_len: usize,
+    column_values_ptr: usize,
+    column_type: ColumnType,
+    missing_opt: Option<u64>,
+    ordered: bool,
+    unique_per_doc: bool,
+}
 
 /// Buffers the values associated with a block of documents loaded from a [`ValueSource`].
 ///
@@ -38,9 +54,75 @@ pub(crate) struct ColumnBlockAccessor {
     cardinality: Cardinality,
     /// Whether any document has multiple values in the loaded block.
     multivalued: bool,
+    /// Active shared-docs scope epoch (0 disables block reuse).
+    shared_docs_epoch: u64,
+    /// Monotonically increasing epoch generator for nested shared-docs scopes.
+    next_shared_docs_epoch: u64,
+    /// Metadata of the currently resident block when loaded inside a shared-docs scope.
+    cached_block: Option<SharedBlockCacheKey>,
 }
 
 impl ColumnBlockAccessor {
+    /// Opens a scope in which sibling collectors receive the exact same immutable `docs` slice.
+    ///
+    /// If an outer scope is already active for the exact same `(docs.as_ptr(), docs.len())`,
+    /// reuses that scope so an already-resident block (e.g. from a parent `SegmentRangeCollector`
+    /// sharing a column with its child metrics) stays hot across the nested call.
+    ///
+    /// Hidden contract: callers must pair every `enter_shared_docs_scope` with
+    /// [`Self::exit_shared_docs_scope`] before the `docs` slice is mutated or dropped.
+    #[inline]
+    pub(crate) fn enter_shared_docs_scope(&mut self, docs: &[DocId]) -> u64 {
+        let prev_epoch = self.shared_docs_epoch;
+        if prev_epoch != 0
+            && self.cached_block.is_some_and(|key| {
+                key.epoch == prev_epoch
+                    && key.docs_ptr == docs.as_ptr() as usize
+                    && key.docs_len == docs.len()
+            })
+        {
+            return prev_epoch;
+        }
+        self.next_shared_docs_epoch = self.next_shared_docs_epoch.wrapping_add(1).max(1);
+        self.shared_docs_epoch = self.next_shared_docs_epoch;
+        self.cached_block = None;
+        prev_epoch
+    }
+
+    /// Closes a shared-docs scope and invalidates any cached block when leaving a distinct scope.
+    #[inline]
+    pub(crate) fn exit_shared_docs_scope(&mut self, prev_epoch: u64) {
+        if prev_epoch != self.shared_docs_epoch {
+            self.shared_docs_epoch = prev_epoch;
+            self.cached_block = None;
+        }
+    }
+
+    #[inline]
+    fn shared_cache_key<S: ValueSource + ?Sized>(
+        &self,
+        docs: &[DocId],
+        source: &S,
+        missing_opt: Option<u64>,
+        ordered: bool,
+        unique_per_doc: bool,
+    ) -> Option<SharedBlockCacheKey> {
+        if self.shared_docs_epoch == 0 {
+            return None;
+        }
+        let physical_col = source.as_physical_column()?;
+        Some(SharedBlockCacheKey {
+            epoch: self.shared_docs_epoch,
+            docs_ptr: docs.as_ptr() as usize,
+            docs_len: docs.len(),
+            column_values_ptr: Arc::as_ptr(&physical_col.values) as *const () as usize,
+            column_type: source.column_type(),
+            missing_opt,
+            ordered,
+            unique_per_doc,
+        })
+    }
+
     /// Fetches a block without deduplicating values within each document.
     ///
     /// Bucket aggregations on multivalued sources should use
@@ -48,6 +130,7 @@ impl ColumnBlockAccessor {
     /// inflate document counts.
     #[inline]
     fn fetch_block<S: ValueSource + ?Sized>(&mut self, docs: &[DocId], source: &mut S) {
+        self.cached_block = None;
         self.cardinality = source.load_block(
             docs,
             &mut self.val_cache,
@@ -73,6 +156,7 @@ impl ColumnBlockAccessor {
         docs: &[DocId],
         column_values: &dyn ColumnValues<u64>,
     ) {
+        self.cached_block = None;
         super::load_full_column_values(docs, column_values, &mut self.val_cache);
         self.cardinality = Cardinality::Full;
         self.multivalued = false;
@@ -94,6 +178,22 @@ impl ColumnBlockAccessor {
     /// run.
     #[inline]
     pub(crate) fn fetch_block_with_missing_ordered<S: ValueSource + ?Sized>(
+        &mut self,
+        docs: &[DocId],
+        source: &mut S,
+        missing_opt: Option<u64>,
+        ordered: bool,
+    ) {
+        let cache_key = self.shared_cache_key(docs, source, missing_opt, ordered, false);
+        if cache_key.is_some() && self.cached_block == cache_key {
+            return;
+        }
+        self.fetch_block_with_missing_ordered_uncached(docs, source, missing_opt, ordered);
+        self.cached_block = cache_key;
+    }
+
+    #[inline]
+    fn fetch_block_with_missing_ordered_uncached<S: ValueSource + ?Sized>(
         &mut self,
         docs: &[DocId],
         source: &mut S,
@@ -183,10 +283,15 @@ impl ColumnBlockAccessor {
         missing: Option<u64>,
         ordered: bool,
     ) {
-        self.fetch_block_with_missing_ordered(docs, source, missing, ordered);
+        let cache_key = self.shared_cache_key(docs, source, missing, ordered, true);
+        if cache_key.is_some() && self.cached_block == cache_key {
+            return;
+        }
+        self.fetch_block_with_missing_ordered_uncached(docs, source, missing, ordered);
         if self.cardinality.is_multivalue() {
             self.dedup_docid_val_pairs();
         }
+        self.cached_block = cache_key;
     }
 
     /// Sorts values within each document when needed for deduplication.
@@ -242,6 +347,12 @@ impl ColumnBlockAccessor {
         let new_len = write + 1;
         self.docid_cache.truncate(new_len);
         self.val_cache.truncate(new_len);
+    }
+
+    /// Returns the cardinality hint of the last fetched block.
+    #[inline]
+    pub(crate) fn cardinality(&self) -> Cardinality {
+        self.cardinality
     }
 
     /// Returns the values fetched by the last `fetch_block*` call.

@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use columnar::{Column, ColumnType};
+use columnar::{Column, ColumnType, MonotonicallyMappableToU64};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -8,7 +8,9 @@ use crate::aggregation::agg_data::AggregationsSegmentCtx;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
 };
-use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
+use crate::aggregation::segment_agg_result::{
+    collect_multiple_fallback, is_strictly_increasing, SegmentAggregationCollector,
+};
 use crate::aggregation::*;
 use crate::TantivyError;
 
@@ -207,21 +209,172 @@ pub enum StatsType {
     Percentiles,
 }
 
+/// Compact 16-byte bucket for `StatsType::Min` or `StatsType::Max` on `I64`/`U64`/`DateTime`.
+///
+/// Fast-field `u64` encodings for these types are order-preserving, so raw `u64` comparisons
+/// avoid `f64` conversion and Kahan summation while avoiding the 40-byte `IntermediateStats`
+/// allocation.
+#[derive(Clone, Copy, Debug)]
+struct MinMaxBucket {
+    value_raw: u64,
+    count: u64,
+}
+
+impl MinMaxBucket {
+    #[inline]
+    fn empty_for_min() -> Self {
+        Self {
+            value_raw: u64::MAX,
+            count: 0,
+        }
+    }
+
+    #[inline]
+    fn empty_for_max() -> Self {
+        Self {
+            value_raw: 0,
+            count: 0,
+        }
+    }
+}
+
+/// Bucket storage specialized once at collector construction based on `collecting_for` and
+/// `COLUMN_TYPE_ID`, avoiding duplicate allocations and Kahan floating-point overhead.
+#[derive(Debug)]
+enum StatsBuckets {
+    Float(Vec<IntermediateStats>),
+    Int(Vec<IntStatsBucket>),
+    Min(Vec<MinMaxBucket>),
+    Max(Vec<MinMaxBucket>),
+    Count(Vec<u64>),
+}
+
+/// Persistent exact integer accumulator per bucket for `I64`/`U64` columns.
+///
+/// Folded into `IntermediateStats` only at finalization (`add_intermediate_aggregation_result`)
+/// or on-demand in `compute_metric_value`, avoiding per-block stack zeroing, `i128 -> f64`
+/// conversions (`__floattidf`), and Kahan floating-point chains.
+#[derive(Clone, Copy, Debug)]
+struct IntStatsBucket {
+    count: u64,
+    sum: i128,
+    min_raw: u64,
+    max_raw: u64,
+}
+
+impl Default for IntStatsBucket {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            count: 0,
+            sum: 0,
+            min_raw: u64::MAX,
+            max_raw: 0,
+        }
+    }
+}
+
+impl IntStatsBucket {
+    #[inline]
+    fn to_intermediate_stats<const COLUMN_TYPE_ID: u8>(
+        self,
+        collecting_for: StatsType,
+    ) -> IntermediateStats {
+        if self.count == 0 {
+            return IntermediateStats::default();
+        }
+        let (sum, delta) = match collecting_for {
+            StatsType::Sum | StatsType::Average | StatsType::Stats => {
+                let hi = self.sum as f64;
+                let lo = (self.sum - hi as i128) as f64;
+                (hi, -lo)
+            }
+            _ => (0.0, 0.0),
+        };
+        let min = match collecting_for {
+            StatsType::Min | StatsType::Stats => convert_to_f64::<COLUMN_TYPE_ID>(self.min_raw),
+            _ => f64::MAX,
+        };
+        let max = match collecting_for {
+            StatsType::Max | StatsType::Stats => convert_to_f64::<COLUMN_TYPE_ID>(self.max_raw),
+            _ => f64::MIN,
+        };
+        IntermediateStats {
+            count: self.count,
+            sum,
+            delta,
+            min,
+            max,
+        }
+    }
+}
+
+fn can_use_i64_block_sum(req: &MetricAggReqData) -> bool {
+    const MAX_SAFE_I64: i64 = 1i64 << 46;
+    const MAX_SAFE_U64: u64 = 1u64 << 47;
+    let Some((min_u64, max_u64)) = req.accessor.bounds() else {
+        return false;
+    };
+    match req.accessor.column_type() {
+        ColumnType::I64 => {
+            let min_val = i64::from_u64(min_u64);
+            let max_val = i64::from_u64(max_u64);
+            let missing_ok = req.missing_u64.map_or(true, |missing| {
+                let missing_i64 = i64::from_u64(missing);
+                missing_i64 >= -MAX_SAFE_I64 && missing_i64 <= MAX_SAFE_I64
+            });
+            min_val >= -MAX_SAFE_I64 && max_val <= MAX_SAFE_I64 && missing_ok
+        }
+        ColumnType::U64 => {
+            let missing_ok = req
+                .missing_u64
+                .map_or(true, |missing| missing <= MAX_SAFE_U64);
+            max_u64 <= MAX_SAFE_U64 && missing_ok
+        }
+        _ => false,
+    }
+}
+
 fn create_collector<const TYPE_ID: u8>(
     req: MetricAggReqData,
 ) -> Box<dyn SegmentAggregationCollector> {
+    const I64_ID: u8 = ColumnType::I64 as u8;
+    const U64_ID: u8 = ColumnType::U64 as u8;
+    const DATE_ID: u8 = ColumnType::DateTime as u8;
+
+    let can_use_fast_int_sum = can_use_i64_block_sum(&req);
     let column_opt = req
         .accessor
         .as_physical_column()
         .map(|column| (column.clone(), req.accessor.column_type()));
+    let buckets = match req.collecting_for {
+        StatsType::Count => StatsBuckets::Count(vec![0]),
+        StatsType::Min
+            if req.is_number_or_date_type && matches!(TYPE_ID, I64_ID | U64_ID | DATE_ID) =>
+        {
+            StatsBuckets::Min(vec![MinMaxBucket::empty_for_min()])
+        }
+        StatsType::Max
+            if req.is_number_or_date_type && matches!(TYPE_ID, I64_ID | U64_ID | DATE_ID) =>
+        {
+            StatsBuckets::Max(vec![MinMaxBucket::empty_for_max()])
+        }
+        StatsType::Sum | StatsType::Average | StatsType::Stats
+            if req.is_number_or_date_type && matches!(TYPE_ID, I64_ID | U64_ID) =>
+        {
+            StatsBuckets::Int(vec![IntStatsBucket::default()])
+        }
+        _ => StatsBuckets::Float(vec![IntermediateStats::default()]),
+    };
     Box::new(SegmentStatsCollector::<TYPE_ID> {
         name: req.name,
         collecting_for: req.collecting_for,
         is_number_or_date_type: req.is_number_or_date_type,
+        can_use_fast_int_sum,
         missing_u64: req.missing_u64,
         column_opt,
         accessor: req.accessor,
-        buckets: vec![IntermediateStats::default()],
+        buckets,
     })
 }
 
@@ -249,13 +402,54 @@ pub(crate) struct SegmentStatsCollector<const COLUMN_TYPE_ID: u8> {
     /// The physical column backing `accessor`, if any, resolved once at construction.
     ///
     /// `collect` is called once per bucket, often with a single doc (e.g. under a
-    /// high-cardinality terms agg), so a per-call virtual dispatch through `accessor` is
+    /// high-cardinality bucket agg), so a per-call virtual dispatch through `accessor` is
     /// measurable.
     pub(crate) column_opt: Option<(Column<u64>, ColumnType)>,
     pub(crate) is_number_or_date_type: bool,
-    pub(crate) buckets: Vec<IntermediateStats>,
+    /// True when column bounds (and `missing_u64`, if any) guarantee that summing up to 65,536
+    /// values in a native `i64`/`u64` cannot overflow, enabling AVX2-vectorizable integer sums.
+    can_use_fast_int_sum: bool,
+    buckets: StatsBuckets,
     pub(crate) name: String,
     pub(crate) collecting_for: StatsType,
+}
+
+impl<const COLUMN_TYPE_ID: u8> SegmentStatsCollector<COLUMN_TYPE_ID> {
+    #[inline]
+    fn bucket_to_intermediate_stats(&self, bucket_id: usize) -> Option<IntermediateStats> {
+        match &self.buckets {
+            StatsBuckets::Float(floats) => floats.get(bucket_id).copied(),
+            StatsBuckets::Int(ints) => ints
+                .get(bucket_id)
+                .map(|slot| slot.to_intermediate_stats::<COLUMN_TYPE_ID>(self.collecting_for)),
+            StatsBuckets::Min(mins) => mins.get(bucket_id).map(|slot| {
+                if slot.count == 0 {
+                    IntermediateStats::default()
+                } else {
+                    IntermediateStats {
+                        count: slot.count,
+                        min: convert_to_f64::<COLUMN_TYPE_ID>(slot.value_raw),
+                        ..IntermediateStats::default()
+                    }
+                }
+            }),
+            StatsBuckets::Max(maxs) => maxs.get(bucket_id).map(|slot| {
+                if slot.count == 0 {
+                    IntermediateStats::default()
+                } else {
+                    IntermediateStats {
+                        count: slot.count,
+                        max: convert_to_f64::<COLUMN_TYPE_ID>(slot.value_raw),
+                        ..IntermediateStats::default()
+                    }
+                }
+            }),
+            StatsBuckets::Count(counts) => counts.get(bucket_id).map(|&count| IntermediateStats {
+                count,
+                ..IntermediateStats::default()
+            }),
+        }
+    }
 }
 
 impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
@@ -271,7 +465,9 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         let name = self.name.clone();
 
         self.prepare_max_bucket(parent_bucket_id, agg_data)?;
-        let stats = self.buckets[parent_bucket_id as usize];
+        let stats = self
+            .bucket_to_intermediate_stats(parent_bucket_id as usize)
+            .unwrap_or_default();
         let intermediate_metric_result = match self.collecting_for {
             StatsType::Average => {
                 IntermediateMetricResult::Average(IntermediateAverage::from_stats(stats))
@@ -306,22 +502,22 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         docs: &[crate::DocId],
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()> {
-        // Fast path: the caller hands us a single doc, which is the dominant case when a metric
-        // sub-agg sits under a high-cardinality bucket agg. Streaming straight from the column
-        // skips the block accessor's buffers entirely.
-        // Only valid without a missing value: `values_for_doc` yields nothing for a doc without a
-        // value, so the substitute would be silently dropped.
-        // Also only valid over a materialized column: `values_for_doc` is per-document random
-        // access, which a computed source cannot offer. Those fall through to the block path
-        // below, which is semantically identical.
-        // TODO: remove once we fetch all values for all bucket ids in one go
+        let bucket_idx = parent_bucket_id as usize;
         if let Some(column_source) = &mut self.column_opt {
+            if let StatsBuckets::Count(counts) = &mut self.buckets {
+                if self.missing_u64.is_none() && column_source.0.index.get_cardinality().is_full() {
+                    counts[bucket_idx] += docs.len() as u64;
+                    return Ok(());
+                }
+            }
             if docs.len() == 1 && self.missing_u64.is_none() {
-                collect_stats::<COLUMN_TYPE_ID>(
-                    &mut self.buckets[parent_bucket_id as usize],
+                collect_single_doc_into_bucket::<COLUMN_TYPE_ID>(
+                    &mut self.buckets,
+                    bucket_idx,
                     column_source.0.values_for_doc(docs[0]),
                     self.is_number_or_date_type,
-                )?;
+                    self.collecting_for,
+                );
                 return Ok(());
             }
             agg_data.column_block_accessor.fetch_block_with_missing(
@@ -336,12 +532,66 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
                 self.missing_u64,
             );
         }
-        collect_stats_slice::<COLUMN_TYPE_ID>(
-            &mut self.buckets[parent_bucket_id as usize],
+        collect_slice_into_bucket::<COLUMN_TYPE_ID>(
+            &mut self.buckets,
+            bucket_idx,
             agg_data.column_block_accessor.values(),
             self.is_number_or_date_type,
+            self.collecting_for,
+            self.can_use_fast_int_sum,
         );
 
+        Ok(())
+    }
+
+    fn collect_multiple(
+        &mut self,
+        bucket_ids: &[BucketId],
+        docs: &[crate::DocId],
+        agg_data: &mut AggregationsSegmentCtx,
+    ) -> crate::Result<()> {
+        debug_assert_eq!(bucket_ids.len(), docs.len());
+        if docs.is_empty() {
+            return Ok(());
+        }
+        if !is_strictly_increasing(docs) {
+            return collect_multiple_fallback(self, bucket_ids, docs, agg_data);
+        }
+        if let Some(column_source) = &mut self.column_opt {
+            agg_data
+                .column_block_accessor
+                .fetch_block_with_missing_ordered(docs, column_source, self.missing_u64, true);
+        } else {
+            agg_data
+                .column_block_accessor
+                .fetch_block_with_missing_ordered(
+                    docs,
+                    &mut *self.accessor,
+                    self.missing_u64,
+                    true,
+                );
+        }
+        let col_block_accessor = &agg_data.column_block_accessor;
+        let vals = col_block_accessor.values();
+        if col_block_accessor.cardinality().is_full() {
+            collect_multiple_full_into_buckets::<COLUMN_TYPE_ID>(
+                &mut self.buckets,
+                bucket_ids,
+                vals,
+                self.is_number_or_date_type,
+                self.collecting_for,
+            );
+        } else {
+            collect_multiple_sparse_into_buckets::<COLUMN_TYPE_ID>(
+                &mut self.buckets,
+                bucket_ids,
+                docs,
+                col_block_accessor.docids(),
+                vals,
+                self.is_number_or_date_type,
+                self.collecting_for,
+            );
+        }
         Ok(())
     }
 
@@ -351,13 +601,28 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         _agg_data: &AggregationsSegmentCtx,
     ) -> crate::Result<()> {
         let required_buckets = (max_bucket as usize) + 1;
-        if self.buckets.len() < required_buckets {
-            self.buckets
-                .resize_with(required_buckets, IntermediateStats::default);
+        match &mut self.buckets {
+            StatsBuckets::Float(floats) if floats.len() < required_buckets => {
+                floats.resize_with(required_buckets, IntermediateStats::default);
+            }
+            StatsBuckets::Int(ints) if ints.len() < required_buckets => {
+                ints.resize_with(required_buckets, IntStatsBucket::default);
+            }
+            StatsBuckets::Min(mins) if mins.len() < required_buckets => {
+                mins.resize(required_buckets, MinMaxBucket::empty_for_min());
+            }
+            StatsBuckets::Max(maxs) if maxs.len() < required_buckets => {
+                maxs.resize(required_buckets, MinMaxBucket::empty_for_max());
+            }
+            StatsBuckets::Count(counts) if counts.len() < required_buckets => {
+                counts.resize(required_buckets, 0);
+            }
+            _ => {}
         }
         Ok(())
     }
 
+    #[inline]
     fn compute_metric_value(
         &self,
         bucket_id: BucketId,
@@ -368,27 +633,72 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         if self.name != sub_agg_name {
             return None;
         }
-        let stats = self.buckets.get(bucket_id as usize)?;
-        // The property depends on what we're collecting:
-        //   - StatsType::Stats exposes count/sum/min/max/avg via dotted property.
-        //   - Single-value kinds (Sum/Count/Min/Max/Average) expect an empty property and return
-        //     the value they were configured to collect.
-        let prop = match self.collecting_for {
-            StatsType::Stats if !sub_agg_property.is_empty() => sub_agg_property,
-            StatsType::Sum if sub_agg_property.is_empty() => "sum",
-            StatsType::Count if sub_agg_property.is_empty() => "count",
-            StatsType::Max if sub_agg_property.is_empty() => "max",
-            StatsType::Min if sub_agg_property.is_empty() => "min",
-            StatsType::Average if sub_agg_property.is_empty() => "avg",
-            _ => return None,
-        };
-        match prop {
-            "count" => Some(stats.count as f64),
-            "sum" => Some(stats.sum),
-            "min" if stats.count > 0 => Some(stats.min),
-            "max" if stats.count > 0 => Some(stats.max),
-            "avg" if stats.count > 0 => Some(stats.sum / stats.count as f64),
-            _ => None,
+        let idx = bucket_id as usize;
+        match &self.buckets {
+            StatsBuckets::Min(mins) => {
+                if !sub_agg_property.is_empty() {
+                    return None;
+                }
+                let slot = mins.get(idx)?;
+                (slot.count > 0).then(|| convert_to_f64::<COLUMN_TYPE_ID>(slot.value_raw))
+            }
+            StatsBuckets::Max(maxs) => {
+                if !sub_agg_property.is_empty() {
+                    return None;
+                }
+                let slot = maxs.get(idx)?;
+                (slot.count > 0).then(|| convert_to_f64::<COLUMN_TYPE_ID>(slot.value_raw))
+            }
+            StatsBuckets::Count(counts) => {
+                if !sub_agg_property.is_empty() {
+                    return None;
+                }
+                counts.get(idx).map(|&count| count as f64)
+            }
+            StatsBuckets::Int(ints) => {
+                let slot = ints.get(idx)?;
+                if slot.count == 0 {
+                    return match (self.collecting_for, sub_agg_property) {
+                        (StatsType::Count, "") | (StatsType::Stats, "count") => Some(0.0),
+                        (StatsType::Sum, "") | (StatsType::Stats, "sum") => Some(0.0),
+                        _ => None,
+                    };
+                }
+                match (self.collecting_for, sub_agg_property) {
+                    (StatsType::Min, "") | (StatsType::Stats, "min") => {
+                        Some(convert_to_f64::<COLUMN_TYPE_ID>(slot.min_raw))
+                    }
+                    (StatsType::Max, "") | (StatsType::Stats, "max") => {
+                        Some(convert_to_f64::<COLUMN_TYPE_ID>(slot.max_raw))
+                    }
+                    (StatsType::Count, "") | (StatsType::Stats, "count") => Some(slot.count as f64),
+                    (StatsType::Sum, "") | (StatsType::Stats, "sum") => Some(slot.sum as f64),
+                    (StatsType::Average, "") | (StatsType::Stats, "avg") => {
+                        Some(slot.sum as f64 / slot.count as f64)
+                    }
+                    _ => None,
+                }
+            }
+            StatsBuckets::Float(floats) => {
+                let stats = floats.get(idx)?;
+                let prop = match self.collecting_for {
+                    StatsType::Stats if !sub_agg_property.is_empty() => sub_agg_property,
+                    StatsType::Sum if sub_agg_property.is_empty() => "sum",
+                    StatsType::Count if sub_agg_property.is_empty() => "count",
+                    StatsType::Max if sub_agg_property.is_empty() => "max",
+                    StatsType::Min if sub_agg_property.is_empty() => "min",
+                    StatsType::Average if sub_agg_property.is_empty() => "avg",
+                    _ => return None,
+                };
+                match prop {
+                    "count" => Some(stats.count as f64),
+                    "sum" => Some(stats.sum),
+                    "min" if stats.count > 0 => Some(stats.min),
+                    "max" if stats.count > 0 => Some(stats.max),
+                    "avg" if stats.count > 0 => Some(stats.sum / stats.count as f64),
+                    _ => None,
+                }
+            }
         }
     }
 }
@@ -401,6 +711,425 @@ fn two_sum(a: f64, b: f64) -> (f64, f64) {
     let b_rounded = s - a;
     let e = (a - (s - b_rounded)) + (b - b_rounded);
     (s, e)
+}
+
+/// Fast single-doc accumulation directly into specialized `StatsBuckets`.
+#[inline]
+fn collect_single_doc_into_bucket<const COLUMN_TYPE_ID: u8>(
+    buckets: &mut StatsBuckets,
+    bucket_idx: usize,
+    vals: impl Iterator<Item = u64>,
+    is_number_or_date_type: bool,
+    collecting_for: StatsType,
+) {
+    const I64_ID: u8 = ColumnType::I64 as u8;
+    match buckets {
+        StatsBuckets::Count(counts) => {
+            counts[bucket_idx] += vals.count() as u64;
+        }
+        StatsBuckets::Min(mins) => {
+            let slot = &mut mins[bucket_idx];
+            for val in vals {
+                slot.count += 1;
+                if val < slot.value_raw {
+                    slot.value_raw = val;
+                }
+            }
+        }
+        StatsBuckets::Max(maxs) => {
+            let slot = &mut maxs[bucket_idx];
+            for val in vals {
+                slot.count += 1;
+                if val > slot.value_raw {
+                    slot.value_raw = val;
+                }
+            }
+        }
+        StatsBuckets::Int(ints) => {
+            let slot = &mut ints[bucket_idx];
+            let track_min_max = matches!(collecting_for, StatsType::Stats);
+            if COLUMN_TYPE_ID == I64_ID {
+                for val in vals {
+                    slot.count += 1;
+                    slot.sum += i64::from_u64(val) as i128;
+                    if track_min_max {
+                        if val < slot.min_raw {
+                            slot.min_raw = val;
+                        }
+                        if val > slot.max_raw {
+                            slot.max_raw = val;
+                        }
+                    }
+                }
+            } else {
+                for val in vals {
+                    slot.count += 1;
+                    slot.sum += val as i128;
+                    if track_min_max {
+                        if val < slot.min_raw {
+                            slot.min_raw = val;
+                        }
+                        if val > slot.max_raw {
+                            slot.max_raw = val;
+                        }
+                    }
+                }
+            }
+        }
+        StatsBuckets::Float(floats) => {
+            let _ = collect_stats::<COLUMN_TYPE_ID>(
+                &mut floats[bucket_idx],
+                vals,
+                is_number_or_date_type,
+            );
+        }
+    }
+}
+
+/// Fast block accumulation directly into specialized `StatsBuckets`.
+#[inline]
+fn collect_slice_into_bucket<const COLUMN_TYPE_ID: u8>(
+    buckets: &mut StatsBuckets,
+    bucket_idx: usize,
+    vals: &[u64],
+    is_number_or_date_type: bool,
+    collecting_for: StatsType,
+    can_use_fast_int_sum: bool,
+) {
+    if vals.is_empty() {
+        return;
+    }
+    const I64_ID: u8 = ColumnType::I64 as u8;
+    match buckets {
+        StatsBuckets::Count(counts) => {
+            counts[bucket_idx] += vals.len() as u64;
+        }
+        StatsBuckets::Min(mins) => {
+            let mut min_raw = vals[0];
+            for &val in &vals[1..] {
+                if val < min_raw {
+                    min_raw = val;
+                }
+            }
+            let slot = &mut mins[bucket_idx];
+            slot.count += vals.len() as u64;
+            if min_raw < slot.value_raw {
+                slot.value_raw = min_raw;
+            }
+        }
+        StatsBuckets::Max(maxs) => {
+            let mut max_raw = vals[0];
+            for &val in &vals[1..] {
+                if val > max_raw {
+                    max_raw = val;
+                }
+            }
+            let slot = &mut maxs[bucket_idx];
+            slot.count += vals.len() as u64;
+            if max_raw > slot.value_raw {
+                slot.value_raw = max_raw;
+            }
+        }
+        StatsBuckets::Int(ints) => {
+            let slot = &mut ints[bucket_idx];
+            let use_native_int = can_use_fast_int_sum && vals.len() <= 65_536;
+            let track_min_max = matches!(collecting_for, StatsType::Stats);
+            if track_min_max {
+                let mut min_raw = vals[0];
+                let mut max_raw = vals[0];
+                let block_sum: i128 = if COLUMN_TYPE_ID == I64_ID {
+                    if use_native_int {
+                        let mut sum_i64: i64 = 0;
+                        for &val in vals {
+                            if val < min_raw {
+                                min_raw = val;
+                            }
+                            if val > max_raw {
+                                max_raw = val;
+                            }
+                            sum_i64 = sum_i64.wrapping_add(i64::from_u64(val));
+                        }
+                        sum_i64 as i128
+                    } else {
+                        let mut sum_i128: i128 = 0;
+                        for &val in vals {
+                            if val < min_raw {
+                                min_raw = val;
+                            }
+                            if val > max_raw {
+                                max_raw = val;
+                            }
+                            sum_i128 += i64::from_u64(val) as i128;
+                        }
+                        sum_i128
+                    }
+                } else if use_native_int {
+                    let mut sum_u64: u64 = 0;
+                    for &val in vals {
+                        if val < min_raw {
+                            min_raw = val;
+                        }
+                        if val > max_raw {
+                            max_raw = val;
+                        }
+                        sum_u64 = sum_u64.wrapping_add(val);
+                    }
+                    sum_u64 as i128
+                } else {
+                    let mut sum_i128: i128 = 0;
+                    for &val in vals {
+                        if val < min_raw {
+                            min_raw = val;
+                        }
+                        if val > max_raw {
+                            max_raw = val;
+                        }
+                        sum_i128 += val as i128;
+                    }
+                    sum_i128
+                };
+                slot.count += vals.len() as u64;
+                slot.sum += block_sum;
+                if min_raw < slot.min_raw {
+                    slot.min_raw = min_raw;
+                }
+                if max_raw > slot.max_raw {
+                    slot.max_raw = max_raw;
+                }
+            } else {
+                let block_sum: i128 = if COLUMN_TYPE_ID == I64_ID {
+                    if use_native_int {
+                        let mut sum_i64: i64 = 0;
+                        for &val in vals {
+                            sum_i64 = sum_i64.wrapping_add(i64::from_u64(val));
+                        }
+                        sum_i64 as i128
+                    } else {
+                        let mut sum_i128: i128 = 0;
+                        for &val in vals {
+                            sum_i128 += i64::from_u64(val) as i128;
+                        }
+                        sum_i128
+                    }
+                } else if use_native_int {
+                    let mut sum_u64: u64 = 0;
+                    for &val in vals {
+                        sum_u64 = sum_u64.wrapping_add(val);
+                    }
+                    sum_u64 as i128
+                } else {
+                    let mut sum_i128: i128 = 0;
+                    for &val in vals {
+                        sum_i128 += val as i128;
+                    }
+                    sum_i128
+                };
+                slot.count += vals.len() as u64;
+                slot.sum += block_sum;
+            }
+        }
+        StatsBuckets::Float(floats) => {
+            collect_stats_slice::<COLUMN_TYPE_ID>(
+                &mut floats[bucket_idx],
+                vals,
+                is_number_or_date_type,
+            );
+        }
+    }
+}
+
+/// Fast multi-bucket block aggregation for `collect_multiple` on full columns.
+#[inline]
+fn collect_multiple_full_into_buckets<const COLUMN_TYPE_ID: u8>(
+    buckets: &mut StatsBuckets,
+    bucket_ids: &[BucketId],
+    vals: &[u64],
+    is_number_or_date_type: bool,
+    collecting_for: StatsType,
+) {
+    const I64_ID: u8 = ColumnType::I64 as u8;
+    match buckets {
+        StatsBuckets::Count(counts) => {
+            for &bucket_id in bucket_ids {
+                counts[bucket_id as usize] += 1;
+            }
+        }
+        StatsBuckets::Min(mins) => {
+            for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                let slot = &mut mins[bucket_id as usize];
+                slot.count += 1;
+                if val < slot.value_raw {
+                    slot.value_raw = val;
+                }
+            }
+        }
+        StatsBuckets::Max(maxs) => {
+            for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                let slot = &mut maxs[bucket_id as usize];
+                slot.count += 1;
+                if val > slot.value_raw {
+                    slot.value_raw = val;
+                }
+            }
+        }
+        StatsBuckets::Int(ints) => {
+            if matches!(collecting_for, StatsType::Stats) {
+                if COLUMN_TYPE_ID == I64_ID {
+                    for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                        let slot = &mut ints[bucket_id as usize];
+                        slot.count += 1;
+                        slot.sum += i64::from_u64(val) as i128;
+                        if val < slot.min_raw {
+                            slot.min_raw = val;
+                        }
+                        if val > slot.max_raw {
+                            slot.max_raw = val;
+                        }
+                    }
+                } else {
+                    for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                        let slot = &mut ints[bucket_id as usize];
+                        slot.count += 1;
+                        slot.sum += val as i128;
+                        if val < slot.min_raw {
+                            slot.min_raw = val;
+                        }
+                        if val > slot.max_raw {
+                            slot.max_raw = val;
+                        }
+                    }
+                }
+            } else if COLUMN_TYPE_ID == I64_ID {
+                for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                    let slot = &mut ints[bucket_id as usize];
+                    slot.count += 1;
+                    slot.sum += i64::from_u64(val) as i128;
+                }
+            } else {
+                for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                    let slot = &mut ints[bucket_id as usize];
+                    slot.count += 1;
+                    slot.sum += val as i128;
+                }
+            }
+        }
+        StatsBuckets::Float(floats) => {
+            if is_number_or_date_type {
+                for (&bucket_id, &val) in bucket_ids.iter().zip(vals.iter()) {
+                    floats[bucket_id as usize].collect(convert_to_f64::<COLUMN_TYPE_ID>(val));
+                }
+            } else {
+                for &bucket_id in bucket_ids {
+                    floats[bucket_id as usize].collect(0.0);
+                }
+            }
+        }
+    }
+}
+
+/// Fast multi-bucket block aggregation for `collect_multiple` on optional/multivalued columns.
+#[inline]
+fn collect_multiple_sparse_into_buckets<const COLUMN_TYPE_ID: u8>(
+    buckets: &mut StatsBuckets,
+    bucket_ids: &[BucketId],
+    docs: &[crate::DocId],
+    fetched_docs: &[crate::DocId],
+    vals: &[u64],
+    is_number_or_date_type: bool,
+    collecting_for: StatsType,
+) {
+    const I64_ID: u8 = ColumnType::I64 as u8;
+    let mut doc_pos = 0usize;
+    match buckets {
+        StatsBuckets::Count(counts) => {
+            for &doc in fetched_docs {
+                while docs[doc_pos] < doc {
+                    doc_pos += 1;
+                }
+                counts[bucket_ids[doc_pos] as usize] += 1;
+            }
+        }
+        StatsBuckets::Min(mins) => {
+            for (&doc, &val) in fetched_docs.iter().zip(vals.iter()) {
+                while docs[doc_pos] < doc {
+                    doc_pos += 1;
+                }
+                let slot = &mut mins[bucket_ids[doc_pos] as usize];
+                slot.count += 1;
+                if val < slot.value_raw {
+                    slot.value_raw = val;
+                }
+            }
+        }
+        StatsBuckets::Max(maxs) => {
+            for (&doc, &val) in fetched_docs.iter().zip(vals.iter()) {
+                while docs[doc_pos] < doc {
+                    doc_pos += 1;
+                }
+                let slot = &mut maxs[bucket_ids[doc_pos] as usize];
+                slot.count += 1;
+                if val > slot.value_raw {
+                    slot.value_raw = val;
+                }
+            }
+        }
+        StatsBuckets::Int(ints) => {
+            let track_min_max = matches!(collecting_for, StatsType::Stats);
+            if COLUMN_TYPE_ID == I64_ID {
+                for (&doc, &val) in fetched_docs.iter().zip(vals.iter()) {
+                    while docs[doc_pos] < doc {
+                        doc_pos += 1;
+                    }
+                    let slot = &mut ints[bucket_ids[doc_pos] as usize];
+                    slot.count += 1;
+                    slot.sum += i64::from_u64(val) as i128;
+                    if track_min_max {
+                        if val < slot.min_raw {
+                            slot.min_raw = val;
+                        }
+                        if val > slot.max_raw {
+                            slot.max_raw = val;
+                        }
+                    }
+                }
+            } else {
+                for (&doc, &val) in fetched_docs.iter().zip(vals.iter()) {
+                    while docs[doc_pos] < doc {
+                        doc_pos += 1;
+                    }
+                    let slot = &mut ints[bucket_ids[doc_pos] as usize];
+                    slot.count += 1;
+                    slot.sum += val as i128;
+                    if track_min_max {
+                        if val < slot.min_raw {
+                            slot.min_raw = val;
+                        }
+                        if val > slot.max_raw {
+                            slot.max_raw = val;
+                        }
+                    }
+                }
+            }
+        }
+        StatsBuckets::Float(floats) => {
+            if is_number_or_date_type {
+                for (&doc, &val) in fetched_docs.iter().zip(vals.iter()) {
+                    while docs[doc_pos] < doc {
+                        doc_pos += 1;
+                    }
+                    floats[bucket_ids[doc_pos] as usize]
+                        .collect(convert_to_f64::<COLUMN_TYPE_ID>(val));
+                }
+            } else {
+                for &doc in fetched_docs {
+                    while docs[doc_pos] < doc {
+                        doc_pos += 1;
+                    }
+                    floats[bucket_ids[doc_pos] as usize].collect(0.0);
+                }
+            }
+        }
+    }
 }
 
 /// Collects a block of values into `LANES` independent Kahan accumulators merged back into
