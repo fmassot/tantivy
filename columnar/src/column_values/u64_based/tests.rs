@@ -190,6 +190,11 @@ proptest! {
     fn test_proptest_small_blockwise_linear(data in proptest::collection::vec(num_strategy(), 1..10)) {
         create_and_validate::<BlockwiseLinearCodec>(&data, "proptest multilinearinterpol");
     }
+
+    #[test]
+    fn test_proptest_small_blockwise_rle_bitpacked(data in proptest::collection::vec(num_strategy(), 1..10)) {
+        create_and_validate::<BlockwiseRleBitpackedCodec>(&data, "proptest rle_bitpacked");
+    }
 }
 
 #[test]
@@ -216,6 +221,11 @@ proptest! {
     #[test]
     fn test_proptest_large_blockwise_linear(data in proptest::collection::vec(num_strategy(), 1..6000)) {
         create_and_validate::<BlockwiseLinearCodec>(&data, "proptest multilinearinterpol");
+    }
+
+    #[test]
+    fn test_proptest_large_blockwise_rle_bitpacked(data in proptest::collection::vec(num_strategy(), 1..6000)) {
+        create_and_validate::<BlockwiseRleBitpackedCodec>(&data, "proptest rle_bitpacked");
     }
 }
 
@@ -331,7 +341,7 @@ fn test_fast_field_codec_type_to_code() {
             count_codec += 1;
         }
     }
-    assert_eq!(count_codec, 3);
+    assert_eq!(count_codec, ALL_U64_CODEC_TYPES.len());
 }
 
 fn test_fastfield_gcd_i64_with_codec(codec_type: CodecType, num_vals: usize) -> io::Result<()> {
