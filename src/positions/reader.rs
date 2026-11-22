@@ -101,6 +101,35 @@ impl PositionReader {
         self.block_offset = self.anchor_offset + (block_rel_id * COMPRESSION_BLOCK_SIZE) as u64;
     }
 
+    /// Reads a single position delta at `offset` without slice-copy overhead.
+    ///
+    /// Optimized for the common `term_freq == 1` case where `offset` hits the already-loaded
+    /// 128-position block.
+    #[inline]
+    pub fn read_single(&mut self, offset: u64) -> u32 {
+        let delta = offset.wrapping_sub(self.block_offset);
+        if delta < COMPRESSION_BLOCK_SIZE as u64 {
+            return self.block_decoder.output_array()[delta as usize];
+        }
+        self.read_single_slow(offset)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_single_slow(&mut self, offset: u64) -> u32 {
+        if offset < self.anchor_offset {
+            self.reset();
+        }
+        let delta_to_anchor_offset = offset - self.anchor_offset;
+        let num_blocks_to_skip =
+            (delta_to_anchor_offset / (COMPRESSION_BLOCK_SIZE as u64)) as usize;
+        if num_blocks_to_skip > 0 {
+            self.advance_num_blocks(num_blocks_to_skip);
+        }
+        self.load_block(0);
+        self.block_decoder.output_array()[(offset as usize) % COMPRESSION_BLOCK_SIZE]
+    }
+
     /// Fills a buffer with the positions `[offset..offset+output.len())` integers.
     ///
     /// This function is optimized to be called with increasing values of `offset`.
@@ -116,9 +145,11 @@ impl PositionReader {
             let delta_to_anchor_offset = offset - self.anchor_offset;
             let num_blocks_to_skip =
                 (delta_to_anchor_offset / (COMPRESSION_BLOCK_SIZE as u64)) as usize;
-            self.advance_num_blocks(num_blocks_to_skip);
+            if num_blocks_to_skip > 0 {
+                self.advance_num_blocks(num_blocks_to_skip);
+            }
             self.load_block(0);
-        } else {
+        } else if self.block_offset != self.anchor_offset {
             // The request offset is within the loaded block.
             // We still need to advance anchor_offset to our current block.
             let num_blocks_to_skip =

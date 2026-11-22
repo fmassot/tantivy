@@ -1,27 +1,38 @@
+#[cfg(test)]
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 
+use common::TinySet;
+
+#[cfg(test)]
 use crate::docset::SeekDangerResult;
+use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{ScoreCombiner, Scorer};
 use crate::{DocId, DocSet, Score, TERMINATED};
 
-/// `Disjunction` is responsible for merging `DocSet` from multiple
-/// source. Specifically, It takes the union of two or more `DocSet`s
-/// then filtering out elements that appear fewer times than a
-/// specified threshold.
-pub struct Disjunction<TScorer, TScoreCombiner = DoNothingCombiner> {
-    chains: BinaryHeap<ScorerWrapper<TScorer>>,
-    minimum_matches_required: usize,
-    score_combiner: TScoreCombiner,
+const HORIZON: u32 = 64u32 * 64u32;
+const HORIZON_NUM_TINYBITSETS: usize = HORIZON as usize / 64;
 
+/// `Disjunction` is responsible for merging `DocSet` from multiple
+/// sources and filtering out documents that appear fewer times than
+/// `minimum_matches_required`.
+///
+/// Uses a 4096-doc sliding window (`HORIZON`) with per-doc match counts and a
+/// `TinySet` presence bitmap, plus pivot seeking across clauses to skip empty
+/// gaps without touching intermediate documents.
+pub struct Disjunction<TScorer, TScoreCombiner = DoNothingCombiner> {
+    docsets: Vec<TScorer>,
+    minimum_matches_required: usize,
+    counts: Box<[u32; HORIZON as usize]>,
+    bitsets: Box<[TinySet; HORIZON_NUM_TINYBITSETS]>,
+    scores: Box<[TScoreCombiner; HORIZON as usize]>,
+    bucket_idx: usize,
+    window_start_doc: DocId,
     current_doc: DocId,
     current_score: Score,
 }
 
-/// A wrapper around a `Scorer` that caches the current `doc_id` and implements the `DocSet` trait.
-/// Also, the `Ord` trait and it's family are implemented reversely. So that we can combine
-/// `std::BinaryHeap<ScorerWrapper<T>>` to gain a min-heap with current doc id as key.
+#[cfg(test)]
 struct ScorerWrapper<T> {
     scorer: T,
     current_doc: DocId,
@@ -29,39 +40,38 @@ struct ScorerWrapper<T> {
 
 #[cfg(test)]
 pub(super) fn seek_danger_test_wrapper(scorer: Box<dyn Scorer>) -> impl DocSet {
-    ScorerWrapper::new(scorer)
-}
-
-impl<T: Scorer> ScorerWrapper<T> {
-    fn new(scorer: T) -> Self {
-        let current_doc = scorer.doc();
-        Self {
-            scorer,
-            current_doc,
-        }
+    let current_doc = scorer.doc();
+    ScorerWrapper {
+        scorer,
+        current_doc,
     }
 }
 
+#[cfg(test)]
 impl<T: Scorer> PartialEq for ScorerWrapper<T> {
     fn eq(&self, other: &Self) -> bool {
         self.doc() == other.doc()
     }
 }
 
+#[cfg(test)]
 impl<T: Scorer> Eq for ScorerWrapper<T> {}
 
+#[cfg(test)]
 impl<T: Scorer> PartialOrd for ScorerWrapper<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(test)]
 impl<T: Scorer> Ord for ScorerWrapper<T> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.doc().cmp(&other.doc()).reverse()
     }
 }
 
+#[cfg(test)]
 impl<T: Scorer> DocSet for ScorerWrapper<T> {
     fn advance(&mut self) -> DocId {
         let doc_id = self.scorer.advance();
@@ -94,6 +104,44 @@ impl<T: Scorer> DocSet for ScorerWrapper<T> {
     }
 }
 
+#[inline(never)]
+fn refill_window<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
+    docsets: &mut Vec<TScorer>,
+    minimum_matches_required: usize,
+    counts: &mut [u32; HORIZON as usize],
+    bitsets: &mut [TinySet; HORIZON_NUM_TINYBITSETS],
+    scores: &mut [TScoreCombiner; HORIZON as usize],
+    min_doc: DocId,
+) -> bool {
+    let horizon = min_doc.saturating_add(HORIZON).min(TERMINATED);
+    counts.fill(0);
+    let min_match_u32 = minimum_matches_required as u32;
+    let mut any_match = false;
+    for scorer in docsets.iter_mut() {
+        loop {
+            let doc = scorer.doc();
+            if doc >= horizon {
+                break;
+            }
+            let delta = (doc - min_doc) as usize;
+            let prev = counts[delta];
+            if prev == 0 {
+                scores[delta].clear();
+            }
+            let next = prev + 1;
+            counts[delta] = next;
+            scores[delta].update(scorer);
+            if next == min_match_u32 {
+                bitsets[delta / 64].insert_mut((delta % 64) as u32);
+                any_match = true;
+            }
+            scorer.advance();
+        }
+    }
+    docsets.retain(|scorer| scorer.doc() != TERMINATED);
+    any_match
+}
+
 impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Disjunction<TScorer, TScoreCombiner> {
     pub fn new<T: IntoIterator<Item = TScorer>>(
         docsets: T,
@@ -104,22 +152,86 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Disjunction<TScorer, TScore
             minimum_matches_required > 1,
             "union scorer works better if just one matches required"
         );
-        let chains = docsets
+        let active_docsets: Vec<TScorer> = docsets
             .into_iter()
-            .map(|doc| ScorerWrapper::new(doc))
+            .filter(|doc| doc.doc() != TERMINATED)
             .collect();
         let mut disjunction = Self {
-            chains,
-            score_combiner,
-            current_doc: TERMINATED,
+            docsets: active_docsets,
             minimum_matches_required,
+            counts: vec![0u32; HORIZON as usize]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            bitsets: Box::new([TinySet::empty(); HORIZON_NUM_TINYBITSETS]),
+            scores: Box::new([score_combiner; HORIZON as usize]),
+            bucket_idx: HORIZON_NUM_TINYBITSETS,
+            window_start_doc: 0,
+            current_doc: TERMINATED,
             current_score: 0.0,
         };
-        if minimum_matches_required > disjunction.chains.len() {
+        if minimum_matches_required > disjunction.docsets.len() {
+            disjunction.docsets.clear();
             return disjunction;
         }
         disjunction.advance();
         disjunction
+    }
+
+    /// Finds the earliest doc where at least `minimum_matches_required` clauses can match,
+    /// seeks lagging clauses to that pivot, and populates the sliding window.
+    #[inline(never)]
+    fn refill(&mut self) -> bool {
+        let min_match = self.minimum_matches_required;
+        loop {
+            if self.docsets.len() < min_match {
+                return false;
+            }
+            self.docsets.sort_unstable_by_key(DocSet::doc);
+            let pivot = self.docsets[min_match - 1].doc();
+            if pivot == TERMINATED {
+                self.docsets.clear();
+                return false;
+            }
+            let mut sought_past_pivot = false;
+            for scorer in &mut self.docsets[..min_match - 1] {
+                if scorer.doc() < pivot {
+                    if scorer.seek(pivot) > pivot {
+                        sought_past_pivot = true;
+                    }
+                }
+            }
+            if sought_past_pivot {
+                self.docsets.retain(|scorer| scorer.doc() != TERMINATED);
+                continue;
+            }
+            self.window_start_doc = pivot;
+            self.bucket_idx = 0;
+            if refill_window(
+                &mut self.docsets,
+                min_match,
+                &mut self.counts,
+                &mut self.bitsets,
+                &mut self.scores,
+                pivot,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    #[inline]
+    fn advance_buffered(&mut self) -> bool {
+        while self.bucket_idx < HORIZON_NUM_TINYBITSETS {
+            if let Some(val) = self.bitsets[self.bucket_idx].pop_lowest() {
+                let delta = val + (self.bucket_idx as u32) * 64;
+                self.current_doc = self.window_start_doc + delta;
+                self.current_score = self.scores[delta as usize].score();
+                return true;
+            }
+            self.bucket_idx += 1;
+        }
+        false
     }
 }
 
@@ -127,33 +239,81 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
     for Disjunction<TScorer, TScoreCombiner>
 {
     fn advance(&mut self) -> DocId {
-        let mut current_num_matches = 0;
-        while let Some(mut candidate) = self.chains.pop() {
-            let next = candidate.doc();
-            if next != TERMINATED {
-                // Peek next doc.
-                if self.current_doc != next {
-                    if current_num_matches >= self.minimum_matches_required {
-                        self.chains.push(candidate);
-                        self.current_score = self.score_combiner.score();
-                        return self.current_doc;
-                    }
-                    // Reset current_num_matches and scores.
-                    current_num_matches = 0;
-                    self.current_doc = next;
-                    self.score_combiner.clear();
-                }
-                current_num_matches += 1;
-                self.score_combiner.update(&mut candidate.scorer);
-                candidate.advance();
-                self.chains.push(candidate);
+        loop {
+            if self.advance_buffered() {
+                return self.current_doc;
+            }
+            if !self.refill() {
+                self.current_doc = TERMINATED;
+                self.current_score = 0.0;
+                return TERMINATED;
             }
         }
-        if current_num_matches < self.minimum_matches_required {
-            self.current_doc = TERMINATED;
+    }
+
+    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
+        if self.current_doc == TERMINATED {
+            return 0;
         }
-        self.current_score = self.score_combiner.score();
-        self.current_doc
+        buffer[0] = self.current_doc;
+        let mut count = 1;
+
+        loop {
+            while self.bucket_idx < HORIZON_NUM_TINYBITSETS {
+                let mut tinyset = self.bitsets[self.bucket_idx];
+                while let Some(val) = tinyset.pop_lowest() {
+                    let delta = val + (self.bucket_idx as u32) * 64;
+                    self.current_doc = self.window_start_doc + delta;
+                    if count >= COLLECT_BLOCK_BUFFER_LEN {
+                        self.bitsets[self.bucket_idx] = tinyset;
+                        self.current_score = self.scores[delta as usize].score();
+                        return COLLECT_BLOCK_BUFFER_LEN;
+                    }
+                    buffer[count] = self.current_doc;
+                    count += 1;
+                }
+                self.bitsets[self.bucket_idx] = TinySet::empty();
+                self.bucket_idx += 1;
+            }
+
+            if !self.refill() {
+                self.current_doc = TERMINATED;
+                self.current_score = 0.0;
+                return count;
+            }
+        }
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        if self.current_doc >= target {
+            return self.current_doc;
+        }
+        let gap = target.saturating_sub(self.window_start_doc);
+        if self.bucket_idx < HORIZON_NUM_TINYBITSETS && gap < HORIZON {
+            let new_bucket_idx = gap as usize / 64;
+            if new_bucket_idx > self.bucket_idx {
+                for obsolete in &mut self.bitsets[self.bucket_idx..new_bucket_idx] {
+                    obsolete.clear();
+                }
+                self.bucket_idx = new_bucket_idx;
+            }
+            let mut doc = self.current_doc;
+            while doc < target {
+                doc = self.advance();
+            }
+            return doc;
+        }
+        for obsolete in self.bitsets.iter_mut() {
+            *obsolete = TinySet::empty();
+        }
+        self.bucket_idx = HORIZON_NUM_TINYBITSETS;
+        for docset in &mut self.docsets {
+            if docset.doc() < target {
+                docset.seek(target);
+            }
+        }
+        self.docsets.retain(|docset| docset.doc() != TERMINATED);
+        self.advance()
     }
 
     #[inline]
@@ -162,19 +322,15 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
     }
 
     fn size_hint(&self) -> u32 {
-        self.chains
+        self.docsets
             .iter()
-            .map(|docset| docset.size_hint())
+            .map(DocSet::size_hint)
             .max()
             .unwrap_or(0u32)
     }
 
     fn cost(&self) -> u64 {
-        self.chains
-            .iter()
-            .map(|docset| docset.cost())
-            .max()
-            .unwrap_or(0u64)
+        self.docsets.iter().map(DocSet::cost).max().unwrap_or(0u64)
     }
 }
 

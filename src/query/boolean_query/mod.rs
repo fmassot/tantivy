@@ -5,7 +5,9 @@ mod boolean_weight;
 mod occur_weights;
 
 pub(crate) use self::block_wand_intersection::block_wand_intersection;
-pub(crate) use self::block_wand_union::{block_wand, block_wand_single_scorer};
+pub(crate) use self::block_wand_union::{
+    block_wand, block_wand_disjunction, block_wand_single_scorer,
+};
 pub use self::boolean_query::BooleanQuery;
 pub use self::boolean_weight::BooleanWeight;
 
