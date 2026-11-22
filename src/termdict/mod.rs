@@ -158,6 +158,55 @@ impl TermDictionary {
     }
 
     #[cfg(feature = "quickwit")]
+    pub(crate) fn automaton_block_chunks(
+        &self,
+        automaton: &impl Automaton,
+        max_chunks: usize,
+        min_bytes_per_chunk: usize,
+    ) -> io::Result<Option<Vec<Vec<(common::OwnedBytes, u64)>>>> {
+        self.0
+            .automaton_block_chunks(automaton, max_chunks, min_bytes_per_chunk)
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn stream_values_from_slices<A>(
+        &self,
+        slices: Vec<(common::OwnedBytes, u64)>,
+        automaton: A,
+    ) -> io::Result<Vec<TermInfo>>
+    where
+        A: Automaton,
+        A::State: Clone,
+    {
+        self.0.stream_values_from_slices(slices, automaton)
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) async fn read_all_sstable_bytes_async(&self) -> io::Result<common::OwnedBytes> {
+        self.0.sstable_slice.read_bytes_async().await
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn all_block_chunks(
+        &self,
+        max_chunks: usize,
+        min_bytes_per_chunk: usize,
+    ) -> io::Result<Option<Vec<(common::OwnedBytes, u64)>>> {
+        self.0.all_block_chunks(max_chunks, min_bytes_per_chunk)
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn stream_values_containing_bytes(
+        &self,
+        slice: common::OwnedBytes,
+        needle: &[u8],
+        disallow_newline: bool,
+    ) -> io::Result<Vec<TermInfo>> {
+        self.0
+            .stream_values_containing_bytes(slice, needle, disallow_newline)
+    }
+
+    #[cfg(feature = "quickwit")]
     /// Lookups the value corresponding to the key.
     pub async fn get_async<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermInfo>> {
         self.0.get_async(key).await

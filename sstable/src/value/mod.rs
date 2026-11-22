@@ -25,6 +25,15 @@ pub trait ValueReader: Default {
     ///
     /// Returns the number of bytes that were read.
     fn load(&mut self, data: &[u8]) -> io::Result<usize>;
+
+    /// Skips a serialized value block without decoding its values, returning its byte length.
+    ///
+    /// Implementations that support fast skipping allow readers (such as automaton streamers)
+    /// to defer `load()` until a key in the block actually matches. Returning `None` falls back
+    /// to eager `load()`.
+    fn skip(&self, _data: &[u8]) -> Option<io::Result<usize>> {
+        None
+    }
 }
 
 /// `ValueWriter` is a trait to make it possible to write blocks

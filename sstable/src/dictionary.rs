@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use common::bounds::{TransformBound, transform_bound_inner_res};
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, ByteCount, OwnedBytes};
+use common::{BinarySerializable, ByteCount, HasLen, OwnedBytes};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use tantivy_fst::Automaton;
@@ -158,6 +158,251 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(DeltaReader::from_multiple_blocks(data))
         }
+    }
+
+    /// Partitions the blocks matching `automaton` into up to `max_chunks` contiguous chunks when
+    /// the total matched byte volume is at least `2 * min_bytes_per_chunk`, returning per-chunk
+    /// `(OwnedBytes, first_ordinal)` slices ready for parallel scanning.
+    ///
+    /// Returns `Ok(None)` when the total volume is small enough to scan in a single pass.
+    pub fn automaton_block_chunks(
+        &self,
+        automaton: &impl Automaton,
+        max_chunks: usize,
+        min_bytes_per_chunk: usize,
+    ) -> io::Result<Option<Vec<Vec<(OwnedBytes, u64)>>>> {
+        if max_chunks <= 1 || automaton.will_always_match(&automaton.start()) {
+            return Ok(None);
+        }
+        let blocks: Vec<BlockAddr> = self
+            .sstable_index
+            .get_block_for_automaton(automaton)
+            .map(|(_, block_addr)| block_addr)
+            .collect();
+        let total_bytes: usize = blocks.iter().map(|b| b.byte_range.len()).sum();
+        if total_bytes < min_bytes_per_chunk.saturating_mul(2) || blocks.len() < 2 {
+            return Ok(None);
+        }
+        let num_chunks = (total_bytes / min_bytes_per_chunk).clamp(2, max_chunks);
+        let target_bytes = total_bytes.div_ceil(num_chunks);
+
+        let mut chunks: Vec<Vec<(OwnedBytes, u64)>> = Vec::with_capacity(num_chunks);
+        let mut cur_slices: Vec<(OwnedBytes, u64)> = Vec::new();
+        let mut cur_bytes: usize = 0;
+        let mut merged_range: Option<(std::ops::Range<usize>, u64)> = None;
+
+        let flush_merged = |merged: &mut Option<(std::ops::Range<usize>, u64)>,
+                            out: &mut Vec<(OwnedBytes, u64)>|
+         -> io::Result<()> {
+            if let Some((range, first_ord)) = merged.take() {
+                let bytes = self.sstable_slice.read_bytes_slice(range)?;
+                out.push((bytes, first_ord));
+            }
+            Ok(())
+        };
+
+        for block in blocks {
+            let block_len = block.byte_range.len();
+            if cur_bytes >= target_bytes && chunks.len() + 1 < num_chunks {
+                flush_merged(&mut merged_range, &mut cur_slices)?;
+                if !cur_slices.is_empty() {
+                    chunks.push(std::mem::take(&mut cur_slices));
+                }
+                cur_bytes = 0;
+            }
+            match &mut merged_range {
+                Some((range, _)) if range.end == block.byte_range.start => {
+                    range.end = block.byte_range.end;
+                }
+                _ => {
+                    flush_merged(&mut merged_range, &mut cur_slices)?;
+                    merged_range = Some((block.byte_range, block.first_ordinal));
+                }
+            }
+            cur_bytes += block_len;
+        }
+        flush_merged(&mut merged_range, &mut cur_slices)?;
+        if !cur_slices.is_empty() {
+            chunks.push(cur_slices);
+        }
+        if chunks.len() <= 1 {
+            return Ok(None);
+        }
+        Ok(Some(chunks))
+    }
+
+    /// Streams all values matching `automaton` from pre-fetched SSTable block slices without
+    /// reconstructing keys.
+    pub fn stream_values_from_slices<A>(
+        &self,
+        slices: Vec<(OwnedBytes, u64)>,
+        automaton: A,
+    ) -> io::Result<Vec<TSSTable::Value>>
+    where
+        A: Automaton,
+        A::State: Clone,
+        TSSTable::Value: Clone,
+    {
+        let delta_reader = DeltaReader::<TSSTable::ValueReader>::from_multiple_blocks(slices);
+        let mut streamer = self
+            .search(automaton)
+            .without_keys()
+            .into_stream_given_delta_reader(delta_reader)?;
+        let mut values = Vec::new();
+        while let Some(value) = streamer.next_without_key() {
+            values.push(value.clone());
+        }
+        Ok(values)
+    }
+
+    /// Partitions all blocks in the SSTable into up to `max_chunks` contiguous byte-balanced
+    /// chunks without walking the FST index.
+    ///
+    /// Returns `Ok(None)` when `max_chunks <= 1` or the total SSTable byte volume is smaller than
+    /// `2 * min_bytes_per_chunk`.
+    pub fn all_block_chunks(
+        &self,
+        max_chunks: usize,
+        min_bytes_per_chunk: usize,
+    ) -> io::Result<Option<Vec<(OwnedBytes, u64)>>> {
+        let total_bytes = self.sstable_slice.len();
+        if max_chunks <= 1 || total_bytes < min_bytes_per_chunk.saturating_mul(2) {
+            return Ok(None);
+        }
+        let num_chunks = (total_bytes / min_bytes_per_chunk).clamp(2, max_chunks);
+        let target_bytes = total_bytes.div_ceil(num_chunks);
+
+        let mut chunks: Vec<(OwnedBytes, u64)> = Vec::with_capacity(num_chunks);
+        let mut cur_range: Option<(std::ops::Range<usize>, u64)> = None;
+        let mut block_id = 0u64;
+        while let Some(block) = self.sstable_index.get_block(block_id) {
+            block_id += 1;
+            match &mut cur_range {
+                Some((range, first_ord))
+                    if range.len() >= target_bytes && chunks.len() + 1 < num_chunks =>
+                {
+                    let bytes = self.sstable_slice.read_bytes_slice(range.clone())?;
+                    chunks.push((bytes, *first_ord));
+                    cur_range = Some((block.byte_range, block.first_ordinal));
+                }
+                Some((range, _)) if range.end == block.byte_range.start => {
+                    range.end = block.byte_range.end;
+                }
+                Some((range, first_ord)) => {
+                    let bytes = self.sstable_slice.read_bytes_slice(range.clone())?;
+                    chunks.push((bytes, *first_ord));
+                    cur_range = Some((block.byte_range, block.first_ordinal));
+                }
+                None => {
+                    cur_range = Some((block.byte_range, block.first_ordinal));
+                }
+            }
+        }
+        if let Some((range, first_ord)) = cur_range {
+            let bytes = self.sstable_slice.read_bytes_slice(range)?;
+            chunks.push((bytes, first_ord));
+        }
+        if chunks.len() <= 1 {
+            return Ok(None);
+        }
+        Ok(Some(chunks))
+    }
+
+    /// Streams all values whose keys contain `needle` from a pre-fetched contiguous SSTable byte
+    /// slice using SIMD `memchr::memmem`, block-level rarest-byte prefiltering, and delta-prefix
+    /// match inheritance.
+    ///
+    /// When `disallow_newline` is `true`, keys containing `b'\n'` are excluded so results match
+    /// standard regex `.*<needle>.*` semantics (where `.` does not match `\n`) on valid UTF-8
+    /// keys.
+    pub fn stream_values_containing_bytes(
+        &self,
+        slice: OwnedBytes,
+        needle: &[u8],
+        disallow_newline: bool,
+    ) -> io::Result<Vec<TSSTable::Value>>
+    where
+        TSSTable::Value: Clone,
+    {
+        let mut delta_reader = DeltaReader::<TSSTable::ValueReader>::new(slice);
+        let mut values = Vec::new();
+        let mut key_buf: Vec<u8> = Vec::with_capacity(256);
+
+        if needle.is_empty() {
+            while let Some(_block_keys) = delta_reader.next_block_lazy()? {
+                key_buf.clear();
+                while delta_reader.advance_in_block() {
+                    let common_prefix_len = delta_reader.common_prefix_len();
+                    let suffix = delta_reader.suffix();
+                    key_buf.truncate(common_prefix_len);
+                    key_buf.extend_from_slice(suffix);
+                    if !disallow_newline || memchr::memchr(b'\n', &key_buf).is_none() {
+                        delta_reader.ensure_values_loaded()?;
+                        values.push(delta_reader.value().clone());
+                    }
+                }
+            }
+            return Ok(values);
+        }
+
+        let finder = memchr::memmem::Finder::new(needle);
+        let filter_byte = select_prefilter_byte(needle);
+        let needle_len = needle.len();
+        let overlap = needle_len - 1;
+
+        while let Some(block_keys) = delta_reader.next_block_lazy()? {
+            if memchr::memchr(filter_byte, block_keys).is_none() {
+                continue;
+            }
+            key_buf.clear();
+            // Invariant: if `matched_end == Some(end)`, then `key_buf[..end]` contains `needle`
+            // and (when `disallow_newline`) `key_buf` contains no `b'\n'`.
+            let mut matched_end: Option<usize> = None;
+            // True only when the previous key contained `needle` but was rejected because it also
+            // contained `b'\n'`. In that rare case, the next key may inherit `needle` in its
+            // prefix without inheriting the `\n`, so we search from index 0.
+            let mut prev_rejected_by_newline = false;
+
+            while delta_reader.advance_in_block() {
+                let common_prefix_len = delta_reader.common_prefix_len();
+                let suffix = delta_reader.suffix();
+                key_buf.truncate(common_prefix_len);
+                key_buf.extend_from_slice(suffix);
+
+                if let Some(end) = matched_end {
+                    if end <= common_prefix_len {
+                        if !disallow_newline || memchr::memchr(b'\n', suffix).is_none() {
+                            delta_reader.ensure_values_loaded()?;
+                            values.push(delta_reader.value().clone());
+                        } else {
+                            matched_end = None;
+                            prev_rejected_by_newline = true;
+                        }
+                        continue;
+                    }
+                    matched_end = None;
+                }
+
+                let search_start = if prev_rejected_by_newline {
+                    0
+                } else {
+                    common_prefix_len.saturating_sub(overlap)
+                };
+                if let Some(rel_pos) = finder.find(&key_buf[search_start..]) {
+                    if !disallow_newline || memchr::memchr(b'\n', &key_buf).is_none() {
+                        matched_end = Some(search_start + rel_pos + needle_len);
+                        prev_rejected_by_newline = false;
+                        delta_reader.ensure_values_loaded()?;
+                        values.push(delta_reader.value().clone());
+                    } else {
+                        prev_rejected_by_newline = true;
+                    }
+                } else {
+                    prev_rejected_by_newline = false;
+                }
+            }
+        }
+        Ok(values)
     }
 
     pub(crate) fn sstable_delta_reader_block(
@@ -470,6 +715,39 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(true)
     }
 
+    /// Streams every term in the dictionary in lexicographical order, invoking `cb` for each term.
+    ///
+    /// Decodes each block directly from its local byte slice without ordinal bookkeeping or
+    /// per-term reader reloads.
+    pub fn stream_all_terms_cb(&self, mut cb: impl FnMut(&[u8])) -> io::Result<()> {
+        if self.num_terms == 0 {
+            return Ok(());
+        }
+        let mut delta_reader =
+            DeltaReader::<TSSTable::ValueReader>::new(self.sstable_slice.read_bytes()?);
+        let mut bytes = Vec::with_capacity(256);
+        while let Some(mut block) = delta_reader.next_block_lazy()? {
+            while !block.is_empty() {
+                let header = block[0];
+                block = &block[1..];
+                let (keep, add) = if header == 1u8 {
+                    let (c1, keep) = crate::vint::deserialize_read(block);
+                    block = &block[c1..];
+                    let (c2, add) = crate::vint::deserialize_read(block);
+                    block = &block[c2..];
+                    (keep as usize, add as usize)
+                } else {
+                    ((header & 0b1111) as usize, (header >> 4) as usize)
+                };
+                bytes.truncate(keep);
+                bytes.extend_from_slice(&block[..add]);
+                block = &block[add..];
+                cb(&bytes);
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the terms for a _sorted_ list of term ordinals.
     ///
     /// Returns true if and only if all terms have been found.
@@ -479,6 +757,76 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         mut cb: impl FnMut(&[u8]),
     ) -> io::Result<bool> {
         assert!(ords.is_sorted());
+        if ords.is_empty() {
+            return Ok(true);
+        }
+
+        // Dense sequential fast path: when the requested ordinals cover a large fraction of the
+        // dictionary (e.g. string cardinality over most docs), stream each block directly from its
+        // local byte slice (using `next_block_lazy`) without per-term DeltaReader reloads or
+        // binary-searching block boundaries.
+        if self.num_terms > 0 && ords.len().saturating_mul(4) >= self.num_terms as usize {
+            if let Some(&last_ord) = ords.last() {
+                if last_ord >= self.num_terms {
+                    return Ok(false);
+                }
+            }
+            let is_all_terms = ords.len() as u64 == self.num_terms
+                && ords.first() == Some(&0)
+                && ords.last() == Some(&(self.num_terms - 1))
+                && ords.iter().enumerate().all(|(idx, &ord)| ord == idx as u64);
+            if is_all_terms {
+                let mut emitted: u64 = 0;
+                self.stream_all_terms_cb(|term| {
+                    cb(term);
+                    emitted += 1;
+                })?;
+                return Ok(emitted == self.num_terms);
+            }
+
+            let mut delta_reader =
+                DeltaReader::<TSSTable::ValueReader>::new(self.sstable_slice.read_bytes()?);
+            let mut bytes = Vec::with_capacity(256);
+            let mut current_ord: u64 = 0;
+            let mut ord_idx: usize = 0;
+            let mut next_target = ords[0];
+
+            while let Some(mut block) = delta_reader.next_block_lazy()? {
+                while !block.is_empty() {
+                    let header = block[0];
+                    block = &block[1..];
+                    let (keep, add) = if header == 1u8 {
+                        let (c1, keep) = crate::vint::deserialize_read(block);
+                        block = &block[c1..];
+                        let (c2, add) = crate::vint::deserialize_read(block);
+                        block = &block[c2..];
+                        (keep as usize, add as usize)
+                    } else {
+                        ((header & 0b1111) as usize, (header >> 4) as usize)
+                    };
+                    bytes.truncate(keep);
+                    bytes.extend_from_slice(&block[..add]);
+                    block = &block[add..];
+
+                    if current_ord == next_target {
+                        loop {
+                            cb(&bytes);
+                            ord_idx += 1;
+                            if ord_idx == ords.len() {
+                                return Ok(true);
+                            }
+                            next_target = ords[ord_idx];
+                            if next_target != current_ord {
+                                break;
+                            }
+                        }
+                    }
+                    current_ord += 1;
+                }
+            }
+            return Ok(ord_idx == ords.len());
+        }
+
         let mut ords = ords.iter().copied();
         let Some(mut ord) = ords.next() else {
             return Ok(true);
@@ -528,8 +876,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                     self.sstable_index.get_and_locate_with_ord(next_ord);
                 current_block_addr = new_block_addr;
                 current_block_ordinal = current_block_addr.first_ordinal;
-                current_sstable_delta_reader =
-                    self.sstable_delta_reader_block(current_block_addr.clone())?;
+                let data = self
+                    .sstable_slice
+                    .read_bytes_slice(current_block_addr.byte_range.clone())?;
+                current_sstable_delta_reader.reset_block(data);
                 bytes.clear();
                 current_block_end_bound = self
                     .sstable_index
@@ -619,10 +969,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
-    pub fn search<'a, A: Automaton + 'a>(
-        &'a self,
-        automaton: A,
-    ) -> StreamerBuilder<'a, TSSTable, A>
+    pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> StreamerBuilder<'a, TSSTable, A>
     where
         A::State: Clone,
     {
@@ -1148,5 +1495,146 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 3); // 0FFFF, 1FFFF, 2FFFF — the dictionary stops below 3FFFF
+    }
+
+    #[test]
+    fn test_stream_values_containing_bytes_matches_regex() {
+        let mut keys: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"abcgoogle".to_vec(),
+            b"abcgoogle\ndef".to_vec(),
+            b"abcgoogle_after".to_vec(),
+            b"abcgooglex".to_vec(),
+            b"goo".to_vec(),
+            b"goog".to_vec(),
+            b"google".to_vec(),
+            b"google\n".to_vec(),
+            b"googlea".to_vec(),
+            b"http://a.google.com/1".to_vec(),
+            b"http://a.google.com/2\n3".to_vec(),
+            b"http://a.google.com/4".to_vec(),
+            b"http://example.com/no".to_vec(),
+            b"http://google.com/page".to_vec(),
+            b"http://gooogle.com/".to_vec(),
+            b"z\ngoogle".to_vec(),
+            b"z_google".to_vec(),
+        ];
+        // Add enough keys to span multiple blocks.
+        for i in 0..4000u32 {
+            keys.push(format!("http://site-{i:04}.example.org/path/{i}").into_bytes());
+            if i % 97 == 0 {
+                keys.push(format!("http://site-{i:04}.google.org/path/{i}").into_bytes());
+            }
+            if i % 193 == 0 {
+                keys.push(format!("http://site-{i:04}.google.org/line\n{i}").into_bytes());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+
+        let mut buffer = Vec::new();
+        let mut writer = Dictionary::<crate::MonotonicU64SSTable>::builder(&mut buffer).unwrap();
+        for (ord, key) in keys.iter().enumerate() {
+            writer.insert(key, &(ord as u64)).unwrap();
+        }
+        writer.finish().unwrap();
+        let dict =
+            Dictionary::<crate::MonotonicU64SSTable>::from_bytes(OwnedBytes::new(buffer)).unwrap();
+
+        for (pattern, needle) in [
+            (".*google.*", b"google".as_slice()),
+            (".*\\.google\\..*", b".google.".as_slice()),
+            (".*site-0097.*", b"site-0097".as_slice()),
+            (".*NO_SUCH_NEEDLE.*", b"NO_SUCH_NEEDLE".as_slice()),
+        ] {
+            let regex = tantivy_fst::Regex::new(pattern).unwrap();
+            let mut stream = dict.search(regex).into_stream().unwrap();
+            let mut expected = Vec::new();
+            while stream.advance() {
+                expected.push(*stream.value());
+            }
+
+            let full = dict.sstable_slice.read_bytes().unwrap();
+            let actual = dict
+                .stream_values_containing_bytes(full, needle, true)
+                .unwrap();
+            assert_eq!(actual, expected, "mismatch for pattern {pattern}");
+
+            // Also verify chunked scanning produces identical results.
+            if let Some(chunks) = dict.all_block_chunks(4, 1024).unwrap() {
+                let mut chunked = Vec::new();
+                for (slice, _) in chunks {
+                    chunked.extend(
+                        dict.stream_values_containing_bytes(slice, needle, true)
+                            .unwrap(),
+                    );
+                }
+                assert_eq!(chunked, expected, "chunked mismatch for pattern {pattern}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_stream_all_terms_cb() {
+        let mut terms: Vec<String> = (0..500)
+            .map(|idx| format!("term-{idx:04}-payload-with-shared-prefix"))
+            .collect();
+        terms.sort();
+        let mut builder = Dictionary::<crate::VoidSSTable>::builder(Vec::new()).unwrap();
+        for term in &terms {
+            builder.insert(term.as_bytes(), &()).unwrap();
+        }
+        let bytes = builder.finish().unwrap();
+        let dict = Dictionary::<crate::VoidSSTable>::from_bytes(OwnedBytes::new(bytes)).unwrap();
+
+        let mut streamed = Vec::new();
+        dict.stream_all_terms_cb(|term_bytes| {
+            streamed.push(String::from_utf8(term_bytes.to_vec()).unwrap());
+        })
+        .unwrap();
+        assert_eq!(streamed, terms);
+    }
+}
+
+/// Picks a byte from `needle` that is relatively rare in URLs and English text so a block-level
+/// `memchr` scan can skip non-matching SSTable blocks before decoding delta keys.
+#[inline]
+fn select_prefilter_byte(needle: &[u8]) -> u8 {
+    let mut best_byte = needle[0];
+    let mut best_score = byte_rarity_score(best_byte);
+    for &byte in &needle[1..] {
+        let score = byte_rarity_score(byte);
+        if score > best_score {
+            best_score = score;
+            best_byte = byte;
+        }
+    }
+    best_byte
+}
+
+#[inline]
+fn byte_rarity_score(byte: u8) -> u8 {
+    match byte {
+        b'e'
+        | b't'
+        | b'a'
+        | b'o'
+        | b'i'
+        | b'n'
+        | b's'
+        | b'r'
+        | b'h'
+        | b'/'
+        | b'.'
+        | b'-'
+        | b'_'
+        | b':'
+        | b' '
+        | b'0'..=b'9' => 1,
+        b'l' | b'd' | b'c' | b'u' | b'm' | b'p' | b'w' => 2,
+        b'a'..=b'z' => 3,
+        b'A'..=b'Z' => 4,
+        _ => 5,
     }
 }
