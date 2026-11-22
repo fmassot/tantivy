@@ -123,6 +123,10 @@ impl<S: TermOrdAccumulator> Debug for SegmentStrCardinalityCollector<S> {
     }
 }
 
+/// Upper bound on dictionary size for using a contiguous flat bitset union in `build_coupon_cache`
+/// (~128 KiB bitset for 1M terms), avoiding `FxHashSet` hashing and `sort_unstable`.
+const COUPON_CACHE_FLAT_UNION_MAX_TERMS: u64 = 1_000_000;
+
 /// Builds a coupon cache from the given buckets, dictionary, and optional missing value.
 /// Returns a mapping from term_ord to the hash (coupon) of the associated term.
 fn build_coupon_cache<S: TermOrdAccumulator>(
@@ -130,7 +134,87 @@ fn build_coupon_cache<S: TermOrdAccumulator>(
     dictionary: &dyn ValueSourceDictionary,
     missing_value_opt: Option<&Key>,
 ) -> io::Result<CouponCache> {
-    // Pass 1 computes the capacity hint, pass 2 inserts.
+    let missing_coupon_opt: Option<Coupon> = missing_value_opt.map(missing_coupon_for_key);
+    let dict_num_terms = dictionary.num_terms();
+    if dict_num_terms == 0 {
+        return Ok(CouponCache::Dense {
+            coupon_map: Vec::new(),
+            missing_coupon_opt,
+        });
+    }
+
+    if dict_num_terms <= COUPON_CACHE_FLAT_UNION_MAX_TERMS {
+        let num_words = (dict_num_terms as usize).div_ceil(64);
+        let mut union_words = vec![0u64; num_words];
+        for bucket in buckets.iter().flatten() {
+            bucket.union_into_words(&mut union_words, dict_num_terms);
+        }
+        let mut num_hit_terms: usize = 0;
+        let mut highest_word_idx: Option<usize> = None;
+        for (word_idx, &word) in union_words.iter().enumerate() {
+            if word != 0 {
+                num_hit_terms += word.count_ones() as usize;
+                highest_word_idx = Some(word_idx);
+            }
+        }
+        let Some(highest_word_idx) = highest_word_idx else {
+            return Ok(CouponCache::Dense {
+                coupon_map: Vec::new(),
+                missing_coupon_opt,
+            });
+        };
+        let highest_bit = 63 - union_words[highest_word_idx].leading_zeros() as usize;
+        let highest_ord = (highest_word_idx << 6) + highest_bit;
+
+        // Dense streaming fast path: when >=25% of dictionary terms are hit across buckets,
+        // stream the SSTable once and fill the dense `coupon_map` in-place — skipping `Vec<u64>`
+        // materialization, intermediate `Vec<Coupon>`, and second copy.
+        if num_hit_terms.saturating_mul(4) >= dict_num_terms as usize {
+            let mut coupon_map = vec![Coupon::from_value(0); highest_ord + 1];
+            let mut current_ord: usize = 0;
+            let limit_ord = highest_ord + 1;
+            dictionary.stream_all_terms_cb(&mut |term_bytes| {
+                if current_ord < limit_ord {
+                    let word = union_words[current_ord >> 6];
+                    if (word >> (current_ord & 63)) & 1 != 0 {
+                        coupon_map[current_ord] = Coupon::from_value(term_bytes);
+                    }
+                }
+                current_ord += 1;
+            })?;
+            return Ok(CouponCache::Dense {
+                coupon_map,
+                missing_coupon_opt,
+            });
+        }
+
+        // Sparse path: extract sorted ordinals directly from the bitset (no FxHashSet or sort).
+        let mut term_ords: Vec<u64> = Vec::with_capacity(num_hit_terms);
+        for (word_idx, &word_val) in union_words[..=highest_word_idx].iter().enumerate() {
+            let mut word = word_val;
+            let base = (word_idx as u64) << 6;
+            while word != 0 {
+                let bit = word.trailing_zeros() as u64;
+                term_ords.push(base + bit);
+                word &= word - 1;
+            }
+        }
+        let mut coupon_map = vec![Coupon::from_value(0); highest_ord + 1];
+        let mut ord_iter = term_ords.iter().copied();
+        let all_term_ords_found: bool =
+            dictionary.sorted_ords_to_term_cb(&term_ords, &mut |term_bytes| {
+                if let Some(ord) = ord_iter.next() {
+                    coupon_map[ord as usize] = Coupon::from_value(term_bytes);
+                }
+            })?;
+        assert!(all_term_ords_found);
+        return Ok(CouponCache::Dense {
+            coupon_map,
+            missing_coupon_opt,
+        });
+    }
+
+    // Fallback for dictionaries exceeding 1M terms: use an FxHashSet union.
     let mut max_bucket_len = 0usize;
     for bucket in buckets.iter().flatten() {
         max_bucket_len = max_bucket_len.max(bucket.len());
@@ -142,7 +226,7 @@ fn build_coupon_cache<S: TermOrdAccumulator>(
     let mut term_ords: Vec<u64> = term_ords_set.into_iter().collect();
     term_ords.sort_unstable();
 
-    term_ords.pop_if(|highest_term_ord| *highest_term_ord >= dictionary.num_terms());
+    term_ords.pop_if(|highest_term_ord| *highest_term_ord >= dict_num_terms);
 
     let mut coupons: Vec<Coupon> = Vec::with_capacity(term_ords.len());
     let all_term_ords_found: bool =
@@ -152,9 +236,6 @@ fn build_coupon_cache<S: TermOrdAccumulator>(
         })?;
     assert!(all_term_ords_found);
 
-    // Regardless of whether or not there is effectively a missing value in one of the buckets,
-    // we populate the cache with the missing key too (if any).
-    let missing_coupon_opt: Option<Coupon> = missing_value_opt.map(missing_coupon_for_key);
     Ok(CouponCache::new(term_ords, coupons, missing_coupon_opt))
 }
 

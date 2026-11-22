@@ -151,6 +151,15 @@ pub(crate) trait TermOrdAccumulator: Sized {
     fn iter_ords(&self) -> impl Iterator<Item = u64> + '_;
     /// Returns `true` if `iter_ords()` yields strictly ascending ordinals.
     fn is_iter_sorted(&self) -> bool;
+    /// Sets the corresponding bit in `union_words` for every ordinal `< limit_ord` in this
+    /// accumulator. Implementations backed by flat bitsets override this with word-level bitwise OR.
+    fn union_into_words(&self, union_words: &mut [u64], limit_ord: u64) {
+        for ord in self.iter_ords() {
+            if ord < limit_ord {
+                union_words[(ord >> 6) as usize] |= 1u64 << (ord & 63);
+            }
+        }
+    }
 }
 
 impl TermOrdAccumulator for BitSet {
@@ -361,6 +370,37 @@ impl TermOrdAccumulator for TermOrdSet {
             }
             TermOrdSetInner::Dense(bitset) => {
                 itertools::Either::Right(itertools::Either::Right(bitset.iter_sorted()))
+            }
+        }
+    }
+
+    fn union_into_words(&self, union_words: &mut [u64], limit_ord: u64) {
+        match &self.inner {
+            TermOrdSetInner::Sparse(set) => {
+                for &ord in set {
+                    if ord < limit_ord {
+                        union_words[(ord >> 6) as usize] |= 1u64 << (ord & 63);
+                    }
+                }
+            }
+            TermOrdSetInner::Flat(bitset) => {
+                let num_words = bitset.words.len().min(union_words.len());
+                for word_idx in 0..num_words {
+                    union_words[word_idx] |= bitset.words[word_idx];
+                }
+                // Mask off any bits at or above `limit_ord` (e.g. the missing sentinel).
+                let rem_bits = (limit_ord & 63) as u32;
+                let last_word_idx = (limit_ord >> 6) as usize;
+                if rem_bits != 0 && last_word_idx < union_words.len() {
+                    union_words[last_word_idx] &= (1u64 << rem_bits) - 1;
+                }
+            }
+            TermOrdSetInner::Dense(bitset) => {
+                for ord in bitset.iter_sorted() {
+                    if ord < limit_ord {
+                        union_words[(ord >> 6) as usize] |= 1u64 << (ord & 63);
+                    }
+                }
             }
         }
     }
