@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
+use common::TinySet;
+
+use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
@@ -120,6 +122,22 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
 
     fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
         self.underlying.fill_buffer(buffer)
+    }
+
+    fn fill_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        self.underlying.fill_bitset_block(min_doc, mask)
+    }
+
+    fn for_each_no_score(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        callback: &mut dyn FnMut(&[DocId]),
+    ) {
+        self.underlying.for_each_no_score(buffer, callback)
     }
 
     fn doc(&self) -> u32 {

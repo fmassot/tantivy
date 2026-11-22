@@ -8,10 +8,10 @@ use crate::query::disjunction::Disjunction;
 use crate::query::explanation::does_not_match;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::term_query::TermScorer;
-use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
+use crate::query::weight::{for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
-    intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
-    RequiredOptionalScorer, Scorer, Weight,
+    intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation,
+    Intersection, Occur, RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, DocSet, Score, TERMINATED};
 
@@ -698,20 +698,25 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             SpecializedScorer::TermUnion(mut term_scorers) => {
                 if term_scorers.len() == 1 {
                     let mut term_scorer = term_scorers.pop().unwrap();
-                    for_each_docset_buffered(&mut term_scorer, &mut buffer, callback);
+                    term_scorer.for_each_no_score(&mut buffer, callback);
                 } else {
                     let mut union_scorer =
                         BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
-                    for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+                    union_scorer.for_each_no_score(&mut buffer, callback);
                 }
             }
-            SpecializedScorer::TermIntersection(term_scorers) => {
-                let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
-                    .into_iter()
-                    .map(|term_scorer| Box::new(term_scorer) as Box<dyn Scorer>)
-                    .collect();
-                let mut intersection = intersect_scorers(boxed_scorers, num_docs);
-                for_each_docset_buffered(intersection.as_mut(), &mut buffer, callback);
+            SpecializedScorer::TermIntersection(mut term_scorers) => {
+                if term_scorers.is_empty() {
+                    // Nothing matches.
+                } else if term_scorers.len() == 1 {
+                    let mut term_scorer = term_scorers.pop().unwrap();
+                    term_scorer.for_each_no_score(&mut buffer, callback);
+                } else {
+                    // Use unboxed `Intersection<TermScorer, TermScorer>` so 3+ term intersections
+                    // avoid dynamic dispatch on every block and inline `fill_bitset_block`.
+                    let mut intersection = Intersection::new(term_scorers, num_docs);
+                    intersection.for_each_no_score(&mut buffer, callback);
+                }
             }
             SpecializedScorer::TermDisjunction {
                 scorers,
@@ -719,14 +724,14 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             } => {
                 let mut disjunction =
                     Disjunction::new(scorers, DoNothingCombiner, minimum_matches_required);
-                for_each_docset_buffered(&mut disjunction, &mut buffer, callback);
+                disjunction.for_each_no_score(&mut buffer, callback);
             }
             other @ SpecializedScorer::WithExclude { .. } => {
                 let mut scorer = into_box_scorer(other, || DoNothingCombiner, num_docs);
-                for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
+                scorer.for_each_no_score(&mut buffer, callback);
             }
             SpecializedScorer::Other(mut scorer) => {
-                for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
+                scorer.for_each_no_score(&mut buffer, callback);
             }
         }
         Ok(())
@@ -1141,8 +1146,7 @@ mod tests {
             exact.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
             exact.truncate(limit);
 
-            let top_docs =
-                searcher.search(query, &TopDocs::with_limit(limit).order_by_score())?;
+            let top_docs = searcher.search(query, &TopDocs::with_limit(limit).order_by_score())?;
             assert_eq!(top_docs.len(), exact.len());
             for ((got_score, got_addr), (exp_score, exp_doc)) in top_docs.iter().zip(exact.iter()) {
                 assert!(

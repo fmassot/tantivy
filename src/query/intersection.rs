@@ -1,8 +1,11 @@
 use common::TinySet;
 
 use super::size_hint::estimate_intersection;
-use crate::docset::{DocSet, SeekDangerResult, BLOCK_NUM_TINYBITSETS, TERMINATED};
+use crate::docset::{
+    DocSet, SeekDangerResult, BLOCK_NUM_TINYBITSETS, COLLECT_BLOCK_BUFFER_LEN, TERMINATED,
+};
 use crate::query::term_query::TermScorer;
+use crate::query::weight::for_each_docset_buffered;
 use crate::query::{EmptyScorer, Scorer};
 use crate::{DocId, Score};
 
@@ -249,6 +252,24 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
         self.left.cost()
     }
 
+    fn for_each_no_score(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        callback: &mut dyn FnMut(&[DocId]),
+    ) {
+        const DENSITY_THRESHOLD_INVERSE: u32 = 32;
+        if self
+            .left
+            .size_hint()
+            .saturating_mul(DENSITY_THRESHOLD_INVERSE)
+            < self.segment_num_docs
+        {
+            for_each_docset_buffered(self, buffer, callback);
+        } else {
+            self.for_each_no_score_dense(buffer, callback);
+        }
+    }
+
     fn count_including_deleted(&mut self) -> u32 {
         const DENSITY_THRESHOLD_INVERSE: u32 = 32;
         if self
@@ -318,12 +339,17 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> 
                 continue;
             }
             // AND with each additional tail.
+            let mut empty = false;
             for other in &mut self.others {
                 let mut other_mask = EMPTY_BLOCK;
                 next_base = next_base.max(other.fill_bitset_block(base, &mut other_mask));
                 if and_blocks_and_return_is_empty(&mut mask, &other_mask) {
-                    continue;
+                    empty = true;
+                    break;
                 }
+            }
+            if empty {
+                continue;
             }
 
             for tinyset in &mask {
@@ -332,6 +358,83 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> 
         }
 
         count
+    }
+
+    /// Dense block-wise bitmask intersection traversal.
+    ///
+    /// Fills a 1024-doc window from each iterator, ANDs the bitmasks together, and unpacks the
+    /// surviving doc IDs into `buffer` before invoking `callback`.
+    fn for_each_no_score_dense(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        callback: &mut dyn FnMut(&[DocId]),
+    ) {
+        let mut next_base = self.left.doc();
+        let mut filled = 0usize;
+
+        while next_base < TERMINATED {
+            let base = next_base;
+
+            // Fill lead bitmask.
+            let mut mask = EMPTY_BLOCK;
+            next_base = next_base.max(self.left.fill_bitset_block(base, &mut mask));
+
+            let mut tail_mask = EMPTY_BLOCK;
+            next_base = next_base.max(self.right.fill_bitset_block(base, &mut tail_mask));
+
+            if and_blocks_and_return_is_empty(&mut mask, &tail_mask) {
+                continue;
+            }
+
+            // AND with each additional tail.
+            let mut empty = false;
+            for other in &mut self.others {
+                let mut other_mask = EMPTY_BLOCK;
+                next_base = next_base.max(other.fill_bitset_block(base, &mut other_mask));
+                if and_blocks_and_return_is_empty(&mut mask, &other_mask) {
+                    empty = true;
+                    break;
+                }
+            }
+            if empty {
+                continue;
+            }
+
+            for (word_idx, tinyset) in mask.into_iter().enumerate() {
+                let mut word = tinyset.as_u64();
+                if word == 0 {
+                    continue;
+                }
+                let word_base = base + ((word_idx as u32) << 6);
+                if word == u64::MAX {
+                    let first_part = COLLECT_BLOCK_BUFFER_LEN - filled;
+                    for i in 0..first_part {
+                        buffer[filled + i] = word_base + i as u32;
+                    }
+                    callback(&buffer[..COLLECT_BLOCK_BUFFER_LEN]);
+                    let second_part = 64 - first_part;
+                    for i in 0..second_part {
+                        buffer[i] = word_base + (first_part + i) as u32;
+                    }
+                    filled = second_part;
+                    continue;
+                }
+                while word != 0 {
+                    let bit = word.trailing_zeros();
+                    word &= word - 1;
+                    buffer[filled] = word_base + bit;
+                    filled += 1;
+                    if filled == COLLECT_BLOCK_BUFFER_LEN {
+                        callback(&buffer[..COLLECT_BLOCK_BUFFER_LEN]);
+                        filled = 0;
+                    }
+                }
+            }
+        }
+
+        if filled > 0 {
+            callback(&buffer[..filled]);
+        }
     }
 }
 
@@ -674,5 +777,126 @@ mod tests {
         let searcher = index.reader().unwrap().searcher();
         let c = searcher.search(&*query, &Count).unwrap();
         assert_eq!(c, 1);
+    }
+
+    proptest! {
+        #[test]
+        fn prop_test_for_each_no_score_matches_intersection(
+            a in sorted_deduped_vec(5000, 1500),
+            b in sorted_deduped_vec(5000, 1500),
+            c in sorted_deduped_vec(5000, 1500),
+            num_docs in 5000u32..5500u32,
+        ) {
+            use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+            use crate::postings::SegmentPostings;
+
+            let expected: Vec<u32> = a.iter()
+                .copied()
+                .filter(|doc| b.binary_search(doc).is_ok() && c.binary_search(doc).is_ok())
+                .collect();
+
+            // Test with real SegmentPostings (exercises bitpacked + VInt + contiguous fast paths).
+            let mut intersection = Intersection::new(
+                vec![
+                    SegmentPostings::create_from_docs(&a),
+                    SegmentPostings::create_from_docs(&b),
+                    SegmentPostings::create_from_docs(&c),
+                ],
+                num_docs,
+            );
+            let mut actual = Vec::new();
+            let mut buf = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+            intersection.for_each_no_score(&mut buf, &mut |docs| actual.extend_from_slice(docs));
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_test_buffered_union_in_dense_intersection(
+            u1 in sorted_deduped_vec(5500, 1200),
+            u2 in sorted_deduped_vec(5500, 1200),
+            u3 in sorted_deduped_vec(5500, 1200),
+            f1 in sorted_deduped_vec(5500, 2000),
+            f2 in sorted_deduped_vec(5500, 2000),
+        ) {
+            use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+            use crate::postings::SegmentPostings;
+            use crate::query::score_combiner::DoNothingCombiner;
+            use crate::query::{BufferedUnionScorer, ConstScorer, Scorer};
+
+            let mut union_expected: Vec<u32> = u1.iter().chain(&u2).chain(&u3).copied().collect();
+            union_expected.sort_unstable();
+            union_expected.dedup();
+            let expected: Vec<u32> = union_expected
+                .into_iter()
+                .filter(|doc| f1.binary_search(doc).is_ok() && f2.binary_search(doc).is_ok())
+                .collect();
+
+            let union_scorer = BufferedUnionScorer::build(
+                vec![
+                    ConstScorer::new(SegmentPostings::create_from_docs(&u1), 1.0),
+                    ConstScorer::new(SegmentPostings::create_from_docs(&u2), 1.0),
+                    ConstScorer::new(SegmentPostings::create_from_docs(&u3), 1.0),
+                ],
+                DoNothingCombiner::default,
+                5500,
+            );
+            let mut intersection = crate::query::intersect_scorers(
+                vec![
+                    Box::new(union_scorer) as Box<dyn Scorer>,
+                    Box::new(ConstScorer::new(SegmentPostings::create_from_docs(&f1), 1.0)),
+                    Box::new(ConstScorer::new(SegmentPostings::create_from_docs(&f2), 1.0)),
+                ],
+                5500,
+            );
+            let mut actual = Vec::new();
+            let mut buf = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+            intersection.for_each_no_score(&mut buf, &mut |docs| actual.extend_from_slice(docs));
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn test_segment_postings_fill_buffer_and_dense_contiguous_intersection() {
+        use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+        use crate::postings::SegmentPostings;
+
+        // Dense contiguous runs spanning multiple 128-doc bitpacked blocks and 1024-doc bitset blocks.
+        let docs_a: Vec<u32> = (0..3000).collect();
+        let docs_b: Vec<u32> = (50..2950).filter(|&doc| doc % 250 != 0).collect();
+        let docs_c: Vec<u32> = (100..2900).filter(|&doc| doc % 3 != 0).collect();
+
+        // Verify SegmentPostings::fill_buffer directly.
+        let mut sp = SegmentPostings::create_from_docs(&docs_a);
+        let mut from_fill_buffer = Vec::new();
+        let mut buf = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+        loop {
+            let n = sp.fill_buffer(&mut buf);
+            from_fill_buffer.extend_from_slice(&buf[..n]);
+            if n < COLLECT_BLOCK_BUFFER_LEN {
+                break;
+            }
+        }
+        assert_eq!(from_fill_buffer, docs_a);
+        assert_eq!(sp.doc(), TERMINATED);
+
+        // Verify dense Intersection::for_each_no_score with full 64-bit words (u64::MAX fast path).
+        let expected: Vec<u32> = docs_a
+            .iter()
+            .copied()
+            .filter(|doc| docs_b.binary_search(doc).is_ok() && docs_c.binary_search(doc).is_ok())
+            .collect();
+        let mut intersection = Intersection::new(
+            vec![
+                SegmentPostings::create_from_docs(&docs_a),
+                SegmentPostings::create_from_docs(&docs_b),
+                SegmentPostings::create_from_docs(&docs_c),
+            ],
+            3000,
+        );
+        let mut actual = Vec::new();
+        intersection.for_each_no_score(&mut buf, &mut |docs| actual.extend_from_slice(docs));
+        assert_eq!(actual, expected);
     }
 }

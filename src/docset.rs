@@ -193,6 +193,24 @@ pub trait DocSet: Send {
         }
     }
 
+    /// Iterates through all remaining documents in the `DocSet`, passing sorted slices of up to
+    /// `COLLECT_BLOCK_BUFFER_LEN` doc IDs to `callback`.
+    ///
+    /// Consumes the `DocSet`. Does not guarantee that scores remain valid.
+    fn for_each_no_score(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        callback: &mut dyn FnMut(&[DocId]),
+    ) {
+        loop {
+            let num_items = self.fill_buffer(buffer);
+            callback(&buffer[..num_items]);
+            if num_items != buffer.len() {
+                break;
+            }
+        }
+    }
+
     /// Returns the number documents matching.
     /// Calling this method consumes the `DocSet`.
     fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
@@ -264,6 +282,14 @@ impl DocSet for &mut dyn DocSet {
         (**self).fill_bitset_block(min_doc, mask)
     }
 
+    fn for_each_no_score(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        callback: &mut dyn FnMut(&[DocId]),
+    ) {
+        (**self).for_each_no_score(buffer, callback)
+    }
+
     fn doc(&self) -> u32 {
         (**self).doc()
     }
@@ -313,6 +339,15 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
     ) -> DocId {
         let unboxed: &mut TDocSet = self.borrow_mut();
         unboxed.fill_bitset_block(min_doc, mask)
+    }
+
+    fn for_each_no_score(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        callback: &mut dyn FnMut(&[DocId]),
+    ) {
+        let unboxed: &mut TDocSet = self.borrow_mut();
+        unboxed.for_each_no_score(buffer, callback)
     }
 
     fn doc(&self) -> DocId {

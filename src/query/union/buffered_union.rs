@@ -1,6 +1,8 @@
 use common::TinySet;
 
-use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+use crate::docset::{
+    DocSet, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, COLLECT_BLOCK_BUFFER_LEN, TERMINATED,
+};
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::size_hint::estimate_union;
 use crate::query::Scorer;
@@ -115,6 +117,54 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> BufferedUnionScorer<TScorer
         }
     }
 
+    /// Refills `self.bitsets` for a new 4096-doc window starting at or after `min_doc`, using
+    /// each child scorer's `fill_bitset_block` without updating `self.scores`.
+    ///
+    /// Contract: only used by `fill_bitset_block` (non-scoring bitset traversal). Leaves
+    /// `self.doc` set to the lowest doc in the new window (already popped from `self.bitsets[0]`),
+    /// or returns `false` if all children are exhausted.
+    #[inline(never)]
+    fn refill_bitsets_only(&mut self, min_doc: DocId) -> bool {
+        for scorer in &mut self.docsets {
+            if scorer.doc() < min_doc {
+                scorer.seek(min_doc);
+            }
+        }
+        self.docsets.retain(|scorer| scorer.doc() != TERMINATED);
+        let Some(start_doc) = self.docsets.iter().map(DocSet::doc).min() else {
+            return false;
+        };
+        self.window_start_doc = start_doc;
+        self.bucket_idx = 0;
+
+        const NUM_CHUNKS: usize = HORIZON_NUM_TINYBITSETS / BLOCK_NUM_TINYBITSETS;
+        for chunk_idx in 0..NUM_CHUNKS {
+            let chunk_min = start_doc.saturating_add((chunk_idx as u32) * BLOCK_WINDOW);
+            if chunk_min >= TERMINATED {
+                break;
+            }
+            let chunk_horizon = chunk_min.saturating_add(BLOCK_WINDOW).min(TERMINATED);
+            let chunk_start = chunk_idx * BLOCK_NUM_TINYBITSETS;
+            let mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS] = (&mut self.bitsets
+                [chunk_start..chunk_start + BLOCK_NUM_TINYBITSETS])
+                .try_into()
+                .unwrap();
+            for scorer in self.docsets.iter_mut() {
+                if scorer.doc() < chunk_horizon {
+                    scorer.fill_bitset_block(chunk_min, mask);
+                }
+            }
+        }
+        self.docsets.retain(|scorer| scorer.doc() != TERMINATED);
+
+        let lowest = self.bitsets[0]
+            .pop_lowest()
+            .expect("start_doc must be present in bitsets[0]");
+        debug_assert_eq!(lowest, 0);
+        self.doc = start_doc;
+        true
+    }
+
     #[inline]
     fn advance_buffered(&mut self) -> bool {
         while self.bucket_idx < HORIZON_NUM_TINYBITSETS {
@@ -188,6 +238,129 @@ where
             if !self.refill() {
                 self.doc = TERMINATED;
                 return count;
+            }
+        }
+    }
+
+    /// Fills `mask` for `[min_doc, min_doc + BLOCK_WINDOW)` using word-level bit shifts from the
+    /// buffered horizon and `fill_bitset_block` refills from children.
+    ///
+    /// Contract: does not maintain `self.scores` (matches `fill_buffer`).
+    fn fill_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        if self.doc == TERMINATED {
+            return TERMINATED;
+        }
+        let horizon = min_doc.saturating_add(BLOCK_WINDOW).min(TERMINATED);
+        if self.doc >= horizon {
+            return self.doc;
+        }
+
+        // Fast skip if the entire currently buffered horizon lies strictly before `min_doc`.
+        if self.window_start_doc.saturating_add(HORIZON) <= min_doc {
+            for tinyset in self.bitsets[self.bucket_idx..].iter_mut() {
+                *tinyset = TinySet::EMPTY;
+            }
+            self.bucket_idx = HORIZON_NUM_TINYBITSETS;
+            if !self.refill_bitsets_only(min_doc) {
+                self.doc = TERMINATED;
+                return TERMINATED;
+            }
+        }
+
+        loop {
+            if self.doc >= horizon {
+                return self.doc;
+            }
+            if self.doc >= min_doc {
+                let delta = self.doc - min_doc;
+                mask[(delta >> 6) as usize].insert_mut(delta & 63);
+            }
+
+            for bucket_idx in self.bucket_idx..HORIZON_NUM_TINYBITSETS {
+                let word = self.bitsets[bucket_idx].as_u64();
+                if word == 0 {
+                    continue;
+                }
+                let bucket_start = self.window_start_doc + (bucket_idx as u32) * 64;
+                let bucket_end = bucket_start + 64;
+                if bucket_end <= min_doc {
+                    self.bitsets[bucket_idx] = TinySet::EMPTY;
+                    continue;
+                }
+                if bucket_start < min_doc {
+                    let skip = min_doc - bucket_start;
+                    if bucket_end > horizon {
+                        let cutoff = horizon - bucket_start;
+                        let in_window = (word & ((1u64 << cutoff) - 1)) >> skip;
+                        if in_window != 0 {
+                            mask[0] = mask[0].union(TinySet::from_u64(in_window));
+                        }
+                        let remaining = word & !((1u64 << cutoff) - 1);
+                        if remaining != 0 {
+                            let bit = remaining.trailing_zeros();
+                            self.bitsets[bucket_idx] =
+                                TinySet::from_u64(remaining & (remaining - 1));
+                            self.bucket_idx = bucket_idx;
+                            self.doc = bucket_start + bit;
+                            return self.doc;
+                        }
+                        self.bitsets[bucket_idx] = TinySet::EMPTY;
+                    } else {
+                        let shifted = word >> skip;
+                        if shifted != 0 {
+                            mask[0] = mask[0].union(TinySet::from_u64(shifted));
+                        }
+                        self.bitsets[bucket_idx] = TinySet::EMPTY;
+                    }
+                } else if bucket_start >= horizon {
+                    let bit = word.trailing_zeros();
+                    self.bitsets[bucket_idx] = TinySet::from_u64(word & (word - 1));
+                    self.bucket_idx = bucket_idx;
+                    self.doc = bucket_start + bit;
+                    return self.doc;
+                } else if bucket_end > horizon {
+                    let cutoff = horizon - bucket_start;
+                    let in_window = word & ((1u64 << cutoff) - 1);
+                    if in_window != 0 {
+                        let rel = bucket_start - min_doc;
+                        let dst_idx = (rel >> 6) as usize;
+                        let shift = rel & 63;
+                        mask[dst_idx] = mask[dst_idx].union(TinySet::from_u64(in_window << shift));
+                        if shift != 0 && dst_idx + 1 < BLOCK_NUM_TINYBITSETS {
+                            mask[dst_idx + 1] = mask[dst_idx + 1]
+                                .union(TinySet::from_u64(in_window >> (64 - shift)));
+                        }
+                    }
+                    let remaining = word & !((1u64 << cutoff) - 1);
+                    if remaining != 0 {
+                        let bit = remaining.trailing_zeros();
+                        self.bitsets[bucket_idx] = TinySet::from_u64(remaining & (remaining - 1));
+                        self.bucket_idx = bucket_idx;
+                        self.doc = bucket_start + bit;
+                        return self.doc;
+                    }
+                    self.bitsets[bucket_idx] = TinySet::EMPTY;
+                } else {
+                    let rel = bucket_start - min_doc;
+                    let dst_idx = (rel >> 6) as usize;
+                    let shift = rel & 63;
+                    mask[dst_idx] = mask[dst_idx].union(TinySet::from_u64(word << shift));
+                    if shift != 0 {
+                        mask[dst_idx + 1] =
+                            mask[dst_idx + 1].union(TinySet::from_u64(word >> (64 - shift)));
+                    }
+                    self.bitsets[bucket_idx] = TinySet::EMPTY;
+                }
+            }
+
+            self.bucket_idx = HORIZON_NUM_TINYBITSETS;
+            if !self.refill_bitsets_only(min_doc) {
+                self.doc = TERMINATED;
+                return TERMINATED;
             }
         }
     }

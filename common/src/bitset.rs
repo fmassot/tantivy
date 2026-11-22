@@ -56,6 +56,18 @@ impl TinySet {
         TinySet(0u64)
     }
 
+    /// Returns the raw 64-bit bitmask underlying this `TinySet`.
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Creates a `TinySet` directly from a 64-bit bitmask.
+    #[inline]
+    pub fn from_u64(bits: u64) -> TinySet {
+        TinySet(bits)
+    }
+
     /// Returns a full `TinySet`.
     #[inline]
     pub fn full() -> TinySet {
